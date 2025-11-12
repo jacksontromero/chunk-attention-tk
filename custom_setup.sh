@@ -24,6 +24,9 @@ echo "Activating environment..."
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate $ENV_NAME
 
+echo "Updating packages"
+sudo apt-get update && sudo apt install build-essential cmake
+
 # Install CUDA 12.4 toolkit with explicit channel specification to avoid version mixing
 echo "Installing CUDA 12.4 toolkit..."
 conda install \
@@ -42,6 +45,7 @@ conda remove binutils_linux-64 ld_impl_linux-64 --force -y 2>/dev/null || true
 
 # Install PyTorch 2.5.1 with CUDA 12.4 via pip
 echo "Installing PyTorch 2.5.1 with CUDA 12.4..."
+python3 -m pip install --upgrade pip mypy
 pip install --no-cache-dir \
     torch==2.5.1+cu124 \
     torchvision==0.20.1+cu124 \
