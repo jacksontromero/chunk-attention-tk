@@ -89,3 +89,8 @@ echo ""
 echo "To build your project, ensure you unset CC/CXX/LD variables and use:"
 echo "  unset CC CXX LD"
 echo "  cmake -S . -B build -DTORCH=\$CONDA_PREFIX/lib/python3.10/site-packages/torch/ -DUSE_CUDA=ON ..."
+
+echo "ThunderKittens env setup"
+export CUDAHOSTCXX=/usr/bin/g++-11
+export CC=/usr/bin/gcc-11
+export CXX=/usr/bin/g++-11
