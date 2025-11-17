@@ -17,13 +17,13 @@ namespace kittens {
 namespace ducks {
 /**
  * @namespace sv
- * 
+ *
  * @brief The namespace where concepts and abstract types for shared vectors live.
  */
 namespace sv {
 /**
  * @brief A dummy type used to identify shared vectors.
- * 
+ *
  * For a type to quack like an sv, it should define its identifier as ducks::sv::identifier.
  * If a type quacks like ducks::sv::identifier, it will be treated as an sv by compiler checks.
  */
@@ -108,9 +108,12 @@ template<ducks::sv::all SV>
 __device__ inline void print(const SV& sv) {
     printf("Shared Vector %d:\n", SV::length);
     for(int i = 0; i < SV::length; i++) {
-        if constexpr (std::is_same_v<typename SV::dtype, fp8e4m3>) {
+        if (false) {
+
+#ifdef KITTENS_HOPPER
+        } else if constexpr (std::is_same_v<typename SV::dtype, fp8e4m3>) {
             printf("%f ", static_cast<float>(sv[i]));
-#ifdef KITTENS_BLACKWELL
+#elif KITTENS_BLACKWELL
         } else if constexpr (std::is_same_v<typename SV::dtype, fp8e8m0>) {
             printf("%f ", static_cast<float>(sv[i]));
 #endif

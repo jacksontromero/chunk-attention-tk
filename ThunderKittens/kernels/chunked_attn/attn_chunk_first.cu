@@ -1,207 +1,75 @@
 #include "../../include/kittens.cuh"
-#include "prototype.cuh"
-
-#ifdef TORCH_COMPILE
-#define TK_COMPILE_FUSED_ROTARY
-#endif
 
 using namespace kittens;
-using namespace kittens::prototype;
-using namespace kittens::prototype::lcsf;
-template<int _headdim, int _warps> struct rotary_layout {
-    static constexpr int headdim = _headdim, warps = _warps;
-    using seq_tile    = st_bf<16, headdim>;
-    using seq_global  = gl<bf16, -1, -1, -1, headdim, seq_tile>;
-    using rope_global = gl<bf16,  1,  1, -1, headdim/2>;
-    struct globals {
-        seq_global o, x;
-        rope_global sin, cos;
-        int batches; // how many batches per block, for sizing grid
-    };
-    struct input_block    { seq_tile x[warps]; };
-    struct output_block   { seq_tile o[warps]; };
-    struct producer_state { int active_warps;  };
-    struct consumer_state { rt_fl<16, headdim/2> sin, cos; }; // long-resident tiles
-};
-template<int _headdim> struct rotary_template {
-    static constexpr int headdim=_headdim, NUM_CONSUMER_WARPS=8, NUM_BLOCKS=1, OUTPUT_PIPE_STAGES=3, INPUT_PIPE_STAGES=3;
-    using layout = rotary_layout<headdim, NUM_CONSUMER_WARPS>;
-    __device__ static inline void common_setup(common_setup_args<layout> args) {
-        if(args.task_iter == 0) {
-            args.num_iters = min(args.globals.batches, (int)(args.globals.x.batch()-blockIdx.y*args.globals.batches)) * args.globals.x.depth(); // batches*heads handled by block
-        }
-        else args.num_iters = -1;
-    }
-    struct producer {
-        __device__ static void setup(producer_setup_args<layout> args) {
-            warpgroup::producer_registers();
-            args.state.active_warps = min((int)NUM_CONSUMER_WARPS,
-                                          (int)(args.globals.x.rows()/16 - blockIdx.x*NUM_CONSUMER_WARPS));
-        }
-        __device__ static void load(producer_load_args<layout> args) {
-            if(warpgroup::warpid() == args.iter%4) {
-                kittens::coord idx = { blockIdx.y*args.globals.batches+args.iter/args.globals.x.depth(),
-                                       args.iter%args.globals.x.depth(),
-                                       blockIdx.x*NUM_CONSUMER_WARPS,
-                                       0 };
-                tma::expect_bytes(args.inputs_arrived, sizeof(layout::seq_tile)*args.state.active_warps);
-                for(int i = 0; i < args.state.active_warps; i++) {
-                    tma::load_async(args.input.x[i], args.globals.x, {idx.b,idx.d,idx.r+i,idx.c}, args.inputs_arrived);
-                }
-                if(laneid() == 0) arrive(args.inputs_arrived, 3);
-                __syncwarp();
-            }
-        }
-        __device__ static void store(producer_store_args<layout> args) {
-            if(warpgroup::warpid() == args.iter%4) {
-                kittens::coord idx = { blockIdx.y*args.globals.batches+args.iter/args.globals.x.depth(),
-                                       args.iter%args.globals.x.depth(),
-                                       blockIdx.x*NUM_CONSUMER_WARPS,
-                                       0 };
-                for(int i = 0; i < args.state.active_warps; i++) {
-                    tma::store_async(args.globals.o, args.output.o[i], {idx.b,idx.d,idx.r+i,idx.c});
-                }
-                tma::store_async_read_wait();
-                if(laneid() == 0) arrive(args.outputs_finished, 4);
-                __syncwarp();
-            }
-        }
-    };
-    struct consumer {
-        __device__ static void setup(consumer_setup_args<layout> args) {
-            warpgroup::consumer_registers<NUM_CONSUMER_WARPS/4>();
-            kittens::coord idx = { blockIdx.x*NUM_CONSUMER_WARPS + warpid(), 0 };
-            load(args.state.sin, args.globals.sin, idx); // could be better coalesced but doing just once
-            load(args.state.cos, args.globals.cos, idx);
-        }
-        __device__ static void compute(consumer_compute_args<layout> args) {
-            rt_fl<16, headdim> x;
-            rt_fl<16, headdim/2> x1, x2, temp1, temp2;
-            load(x, args.input.x[warpid()]);
-            if(laneid() == 0) arrive(args.inputs_finished);
-            __syncwarp();
-            for(int i = 0; i < headdim/32; i++) {
-                #pragma unroll
-                for(int j = 0; j < 4; j++) {
-                    x1.tiles[0][i].data[j] = x.tiles[0][i].data[j];
-                    x2.tiles[0][i].data[j] = x.tiles[0][i+headdim/32].data[j];
-                }
-            }
-            mul(temp1, x1, args.state.cos);
-            mul(temp2, x2, args.state.cos);
-            mul(x2, x2, -1.f);
-            mul(x1, x1, args.state.sin);
-            mul(x2, x2, args.state.sin);
-            add(temp1, temp1, x2);
-            add(temp2, temp2, x1);
-            for(int i = 0; i < headdim/32; i++) {
-                #pragma unroll
-                for(int j = 0; j < 4; j++) {
-                    x.tiles[0][i].data[j]            = temp1.tiles[0][i].data[j];
-                    x.tiles[0][i+headdim/32].data[j] = temp2.tiles[0][i].data[j];
-                }
-            }
-            store(args.output.o[warpid()], x);
-            __syncwarp();
-            if(laneid() == 0) arrive(args.outputs_arrived);
-        }
-        __device__ static void finish(consumer_finish_args<layout> args) {
-            if(laneid() == 0) arrive(args.finish_finished); // nothing to do here
-        }
-    };
+
+#define BLOCK_SIZE 32
+
+// TODO MAXIMUM HEAD DIM IS 128
+template<int D> constexpr size_t TILE_SIZE = 16*(128/D); // height of each tile (rows)
+template<int D> using shared_tile = st_bf<TILE_SIZE<D>, D>;
+template<int d_head> struct attn_chunk_first_globals {
+    using _gl_float = gl<float, -1, -1, -1, -1>;
+    using _gl_int = gl<int, -1, -1, -1, -1>;
+    _gl_float gAttns, gMaxs, gSums;
+    _gl_int gOffsets, gBegins, gEnds;
+    gl<float, -1, -1, -1, d_head, shared_tile<d_head>> gQ_S_H_D;
+    void** gKeys;
+    void** gValues;
+    float dim_scale;
+    int n_heads;
 };
 
-#ifdef TK_COMPILE_FUSED_ROTARY
-#include "pyutils/torch_helpers.cuh"
-#include <iostream>
-template<int ATTN_D>
-void dispatch_fused_rotary(
-    bf16 * d_o,
-    bf16 * d_x,
-    bf16 * d_sin_in,
-    bf16 * d_cos_in,
-    const int ATTN_B, const int ATTN_H, const int ATTN_N
-) {
+template<int n_seqs, int chunk_size, int d_head>
+__global__ void attn_chunk_first_tk(const __grid_constant__ attn_chunk_first_globals<d_head> g) {
+    extern __shared__ alignment_dummy __shm[];
+    shared_allocator al((int*)&__shm[0]);
 
-    using rope_t = rotary_template<ATTN_D>;
-    constexpr int BATCHES_PER_BLOCK = 4;
+    const uint32_t head_idx = blockIdx.x;
+    const uint32_t chunk_idx = blockIdx.y;
 
-    using seq_globals   = typename rope_t::layout::seq_global;
-    using rope_globals  = typename rope_t::layout::rope_global;
-    using globals = typename rope_t::layout::globals;
+    const int seq_begin = g.gBegins[chunk_idx];
+    const int seq_end = g.gEnds[chunk_idx];
+    const int n = seq_end - seq_begin;
 
-    seq_globals Og{d_o, ATTN_B, ATTN_H, ATTN_N, nullptr};
-    seq_globals Xg{d_x, ATTN_B, ATTN_H, ATTN_N, nullptr};
-    rope_globals SINg{d_sin_in, nullptr, nullptr, ATTN_N, nullptr};
-    rope_globals COSg{d_cos_in, nullptr, nullptr, ATTN_N, nullptr};
-    globals g{Og, Xg, SINg, COSg, BATCHES_PER_BLOCK};
+    // const int n_heads = g.n_heads;
+    // const int* offsets = g.gOffsets;
 
-    unsigned long mem_size = (MAX_SHARED_MEMORY-2048);
-    constexpr int ROWS_PER_BLOCK = rope_t::NUM_CONSUMER_WARPS * rope_t::layout::seq_tile::rows;
-    cudaFuncSetAttribute(prototype::lcsf::kernel<rope_t>, cudaFuncAttributeMaxDynamicSharedMemorySize, mem_size);
-    dim3 grid((ATTN_N+ROWS_PER_BLOCK-1)/ROWS_PER_BLOCK, (ATTN_B+BATCHES_PER_BLOCK-1)/BATCHES_PER_BLOCK);
-    dim3 block(kittens::prototype::detail::NUM_THREADS_v<rope_t>);
-    kittens::prototype::lcsf::kernel<rope_t><<<grid, block, mem_size>>>(g);
+    // const uint32_t q_row_offset = seq_begin * n_heads * d_head + head_idx * d_head;
+    // const uint32_t kv_row_offset = head_idx * chunk_size * d_head;
+    // const int result_offset = offsets[chunk_idx];
+    // const uint32_t max_sum_offset = result_offset * n_heads + head_idx * n;
+    // const uint32_t attn_offset = max_sum_offset * d_head;
+
+    auto* __restrict__ k = reinterpret_cast<float*>(g.gKeys[chunk_idx]);
+
+    shared_tile<d_head> &Qs = al.allocate<shared_tile<d_head>>();
+    shared_tile<d_head> &Ks = al.allocate<shared_tile<d_head>>();
+    const int rows_per_tile = TILE_SIZE<d_head>;
+
+    // thread block process a [n_seqs, d_head] tile of Q starting from q+q_row_offset with stride n_heads * d_head
+    // thread block processes a [chunk_size, d_head] tile of K starting from k + kv_row_offset with stride d_head
+
+    int q_iters = (n_seqs + rows_per_tile - 1) / rows_per_tile;
+    for (int i = 0; i < q_iters; i++) {
+        int q_start = seq_begin + i * rows_per_tile;
+        load(Qs, g.gQ_S_H_D, {q_start, head_idx, 0, 0});
+
+        int k_iters = (chunk_size + rows_per_tile - 1) / rows_per_tile;
+        for (int j = 0; j < k_iters; j++) {
+            int k_start = j * rows_per_tile;
+            load(Ks, k, {head_idx, k_start, 0});
+
+        }
+    }
 }
 
-torch::Tensor fused_rotary(
-    const torch::Tensor x,
-    const torch::Tensor cos_in,
-    const torch::Tensor sin_in
-) {
-    CHECK_INPUT(x);
-    CHECK_INPUT(sin_in);
-    CHECK_INPUT(cos_in);
+// Q: [n_seqs, d_head] w/ stride n_heads * d_head. COULD get [tile, d_head]
+// K: [chunk_size, d_head] w/ stride d_head. COULD get [tile, d_head]
 
-    const int B = x.size(0);
-    const int H = x.size(1);
-    const int N = x.size(2);
+// NOTES:
+// - In kernel_cuda, it's assumed that n_seqs*chunk_size fits in shared memory. We should make the same assumption here.
+// - Need to figure out if K is row or column layout - changes best loading strategy.
+// - Maybe we should just get a working version that assumes everything fits in shared memory? Honestly a good idea ngl
 
-    TORCH_CHECK(B == x.size(0), "Batch size mismatch");
-    TORCH_CHECK(H == x.size(1), "Head size mismatch");
-    TORCH_CHECK(N == x.size(2), "Sequence length mismatch");
-    TORCH_CHECK(x.size(3) == 64 || x.size(3) == 128, "Hidden size mismatch");
 
-    TORCH_CHECK(x.size(2) % 16 == 0, "Sequence length must be multiple of 16");
-    TORCH_CHECK(cos_in.size(0) % 16 == 0, "Sequence length must be multiple of 16");
-    TORCH_CHECK(sin_in.size(0) % 16 == 0, "Sequence length must be multiple of 16");
-
-    torch::Tensor out = torch::empty({B, H, N, x.size(3)}, x.options());
-
-    // convert to bf16
-    c10::BFloat16 *x_bf16 = x.data_ptr<c10::BFloat16>();
-    c10::BFloat16 *sin_in_bf16 = sin_in.data_ptr<c10::BFloat16>();
-    c10::BFloat16 *cos_in_bf16 = cos_in.data_ptr<c10::BFloat16>();
-    c10::BFloat16 *out_bf16 = out.data_ptr<c10::BFloat16>();
-
-    bf16 *d_x = reinterpret_cast<bf16*>(x_bf16);
-    bf16 *d_sin_in = reinterpret_cast<bf16*>(sin_in_bf16);
-    bf16 *d_cos_in = reinterpret_cast<bf16*>(cos_in_bf16);
-    bf16 *d_out = reinterpret_cast<bf16*>(out_bf16);
-
-    if(x.size(3) == 64) {
-        dispatch_fused_rotary<64>(
-            d_out,
-            d_x,
-            d_sin_in,
-            d_cos_in,
-            B, H, N
-        );
-    }
-    else {
-        dispatch_fused_rotary<128>(
-            d_out,
-            d_x,
-            d_sin_in,
-            d_cos_in,
-            B, H, N
-        );
-    }
-
-    CHECK_CUDA_ERROR(cudaGetLastError());
-    return out;
-}
-
-#else
 #include "harness.impl"
-#endif

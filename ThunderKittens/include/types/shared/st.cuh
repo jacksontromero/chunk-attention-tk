@@ -15,13 +15,13 @@ namespace kittens {
 namespace ducks {
 /**
  * @namespace rt
- * 
+ *
  * @brief The namespace where concepts and abstract types for shared tiles live.
  */
 namespace st {
 /**
  * @brief A dummy type used to identify shared tiles.
- * 
+ *
  * For a type to quack like an st, it should define its identifier as ducks::st::identifier.
  * If a type quacks like ducks::st::identifier, it will be treated as an st by compiler checks.
  * This is particularly useful for subtiles.
@@ -297,37 +297,40 @@ template<int _height, int _width> using st_fp8e8m0 = st<fp8e8m0, _height, _width
 
 /**
  * @brief Print the contents of a shared tile as a formatted table.
- * 
+ *
  * This function should be called by a single thread in the warp.
  * It will print the entire tile atomically to avoid interleaved output.
- * 
+ *
  * @param tile The shared tile to print
  */
 template<ducks::st::all ST>
 __device__ inline void print(const ST& tile) {
     printf("Shared Tile %dx%d:\n", ST::rows, ST::cols);
-    
+
     // Print column headers
     printf("     "); // Padding for row indices
     for (int c = 0; c < ST::cols; c++) {
         printf("%8d ", c);
     }
     printf("\n");
-    
+
     // Print separator line
     printf("     ");
     for (int c = 0; c < ST::cols; c++) {
         printf("--------+");
     }
     printf("\n");
-    
+
     // Print data rows
     for (int r = 0; r < ST::rows; r++) {
         printf("%3d |", r); // Row index
         for (int c = 0; c < ST::cols; c++) {
-            if constexpr (std::is_same_v<typename ST::dtype, fp8e4m3>) {
+            if (false) {
+
+#ifdef KITTENS_HOPPER
+            } else if constexpr (std::is_same_v<typename ST::dtype, fp8e4m3>) {
                 printf("%8.3f ", static_cast<float>(tile[{r,c}]));
-#ifdef KITTENS_BLACKWELL
+#elif KITTENS_BLACKWELL
             } else if constexpr (std::is_same_v<typename ST::dtype, fp8e8m0>) {
                 printf("%8.3f ", static_cast<float>(tile[{r,c}]));
 #endif

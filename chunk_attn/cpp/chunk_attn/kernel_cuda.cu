@@ -752,7 +752,7 @@ __global__ void attn_chunk_first_kernel(
     const int result_offset = offsets[chunk_idx];
     const uint32_t max_sum_offset = result_offset * n_heads + head_idx * n;
     const uint32_t attn_offset = max_sum_offset * d_head;
-    
+
     const scalar_t* q = query + q_row_offset;
     auto* __restrict__ k = reinterpret_cast<scalar_t*>(keys[chunk_idx]) + kv_row_offset;
     auto* __restrict__ v = reinterpret_cast<scalar_t*>(values[chunk_idx]) + kv_row_offset;
@@ -846,6 +846,7 @@ __global__ void attn_chunk_first_kernel_v2(
     scalar_t* shared_v = shared_half_score + n_seqs * padded_chunk_size;
     scalar_t* shared_output = shared_v + chunk_size * padded_head_dim;
     // share v with k
+    // thread block loads a [n_seqs, d_head] tile of Q starting from q+q_row_offset
     matrix_multiply_gAB_sC<scalar_t, n_seqs, chunk_size, d_head>(
       q, n_heads * d_head, shared_q, k, shared_k, shared_weight, padded_chunk_size);
 
