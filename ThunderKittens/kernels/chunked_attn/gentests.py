@@ -1,86 +1,130 @@
-# import torch
-# import torch.nn as nn
-# from tqdm import trange
-# import numpy as np
-# import sys
-# import math
-# from einops import rearrange, repeat
+import torch
+import torch.nn.functional as F
+from tqdm import trange
+import numpy as np
+import sys
+import math
 
-# B = 1
-# H = 1
-# N = 2048
-# D = 64
+# Simple test configuration for chunked attention
+# We'll test with a single chunk scenario first
+N_SEQS = 16      # number of sequences attending to chunk
+CHUNK_SIZE = 64  # size of KV chunk
+D_HEAD = 128     # head dimension
+N_HEADS = 4      # number of attention heads
+N_CHUNKS = 2     # number of chunks to test
 
-# D_2 = D // 2
+TESTNAME = sys.argv[1] if len(sys.argv) > 1 else 'randn'
 
-# TESTNAME = sys.argv[1]
+print(f"Generating test: {TESTNAME}")
+print(f"N_SEQS={N_SEQS}, CHUNK_SIZE={CHUNK_SIZE}, D_HEAD={D_HEAD}, N_HEADS={N_HEADS}, N_CHUNKS={N_CHUNKS}")
 
-# if TESTNAME == 'ones':
-#     x = torch.ones((B, H, N, D), dtype=torch.bfloat16, device='cuda').requires_grad_()
-# elif TESTNAME == 'randn':
-#     torch.random.manual_seed(42)
-#     x = torch.randn((B, H, N, D), dtype=torch.bfloat16, device='cuda').requires_grad_()
-# else:
-#     print('Invalid test name')
-#     sys.exit(0)
+softmax_scale = 1.0 / math.sqrt(D_HEAD)
 
+if TESTNAME == 'ones':
+    torch.manual_seed(42)
+    q = torch.ones((N_SEQS, N_HEADS, D_HEAD), dtype=torch.float32, device='cuda')
+    k_chunks = [torch.ones((N_HEADS, CHUNK_SIZE, D_HEAD), dtype=torch.float32, device='cuda') for _ in range(N_CHUNKS)]
+    v_chunks = [torch.ones((N_HEADS, CHUNK_SIZE, D_HEAD), dtype=torch.float32, device='cuda') for _ in range(N_CHUNKS)]
+elif TESTNAME == 'randn':
+    torch.manual_seed(42)
+    q = torch.randn((N_SEQS, N_HEADS, D_HEAD), dtype=torch.float32, device='cuda')
+    k_chunks = [torch.randn((N_HEADS, CHUNK_SIZE, D_HEAD), dtype=torch.float32, device='cuda') for _ in range(N_CHUNKS)]
+    v_chunks = [torch.randn((N_HEADS, CHUNK_SIZE, D_HEAD), dtype=torch.float32, device='cuda') for _ in range(N_CHUNKS)]
+elif TESTNAME == 'simple':
+    torch.manual_seed(42)
+    q = torch.randn((N_SEQS, N_HEADS, D_HEAD), dtype=torch.float32, device='cuda') * 0.1
+    k_chunks = [torch.randn((N_HEADS, CHUNK_SIZE, D_HEAD), dtype=torch.float32, device='cuda') * 0.1 for _ in range(N_CHUNKS)]
+    v_chunks = [torch.eye(D_HEAD)[:CHUNK_SIZE].unsqueeze(0).repeat(N_HEADS, 1, 1).cuda() for _ in range(N_CHUNKS)]
+else:
+    print('Invalid test name')
+    sys.exit(1)
 
-# def get_output(x, rotary_emb_base=10000, rotary_emb_dim=D, dtype=torch.bfloat16):
+# Compute reference output for each chunk
+# For each chunk, compute: softmax(Q @ K.T / sqrt(d)) @ V
+outputs_ref = []
+maxs_ref = []
+sums_ref = []
 
-#     t = torch.arange(N, device=x.device, dtype=dtype) # We want fp32 here
-#     inv_freq = 1.0 / (rotary_emb_base ** (torch.arange(0, rotary_emb_dim, 2, device=x.device, dtype=dtype) / rotary_emb_dim))
-#     freqs = torch.outer(t, inv_freq).to(dtype=dtype)
-#     cos_in = torch.cos(freqs).to(dtype=dtype)
-#     sin_in = torch.sin(freqs).to(dtype=dtype)
+for chunk_idx in range(N_CHUNKS):
+    k_chunk = k_chunks[chunk_idx]  # [N_HEADS, CHUNK_SIZE, D_HEAD]
+    v_chunk = v_chunks[chunk_idx]  # [N_HEADS, CHUNK_SIZE, D_HEAD]
 
-#     ro_dim = cos_in.shape[-1] * 2
-#     assert ro_dim <= x.shape[-1]
+    chunk_outputs = []
+    chunk_maxs = []
+    chunk_sums = []
 
-#     ###
+    for head_idx in range(N_HEADS):
+        q_head = q[:, head_idx, :]  # [N_SEQS, D_HEAD]
+        k_head = k_chunk[head_idx]  # [CHUNK_SIZE, D_HEAD]
+        v_head = v_chunk[head_idx]  # [CHUNK_SIZE, D_HEAD]
 
-#     x_ro_dim     = x[..., :ro_dim]
-#     x_ro_dim_end = x[..., ro_dim:]
+        # Compute attention scores: [N_SEQS, CHUNK_SIZE]
+        scores = torch.matmul(q_head, k_head.T) * softmax_scale
 
-#     x1, x2 = x_ro_dim.chunk(2, dim=-1)              # D/2, D/2
-#     rotated_x = torch.cat((-x2, x1), dim=-1)        # D
+        # Compute max for numerical stability
+        max_scores = scores.max(dim=1, keepdim=True)[0]  # [N_SEQS, 1]
 
-#     cos = repeat(cos_in, "n d -> 1 n (2 d)" )
-#     sin = repeat(sin_in, "n d -> 1 n (2 d)" )
-#     o = torch.cat([x_ro_dim * cos + rotated_x * sin, x_ro_dim_end], dim=-1)
+        # Compute exp and sum
+        exp_scores = torch.exp(scores - max_scores)  # [N_SEQS, CHUNK_SIZE]
+        sum_scores = exp_scores.sum(dim=1, keepdim=True)  # [N_SEQS, 1]
 
-#     # o = x_ro_dim * cos + rotated_x * sin
-#     # o_ref = torch.concat([-x2*sin_in, x1*sin_in], dim=-1)
-#     # o_ref = torch.concat([x1*cos_in + -x2*sin_in, x2*cos_in + x1*sin_in], dim=-1)
-#     # diff = torch.norm(o-o_ref).item()
-#     # print(f"{diff=}")
-#     ###
+        # Compute attention output: [N_SEQS, D_HEAD]
+        attn_output = torch.matmul(exp_scores, v_head)
 
-#     return o, ro_dim, cos_in, sin_in
+        chunk_outputs.append(attn_output)
+        chunk_maxs.append(max_scores.squeeze())
+        chunk_sums.append(sum_scores.squeeze())
 
-# o, ro_dim, cos_in, sin_in = get_output(x)
+    outputs_ref.append(torch.stack(chunk_outputs, dim=0))  # [N_HEADS, N_SEQS, D_HEAD]
+    maxs_ref.append(torch.stack(chunk_maxs, dim=0))  # [N_HEADS, N_SEQS]
+    sums_ref.append(torch.stack(chunk_sums, dim=0))  # [N_HEADS, N_SEQS]
 
-# with open(f'{TESTNAME}.txt', 'w') as f:
-#     xf      = x.to(torch.float32).flatten().detach().cpu().numpy()
-#     cos_inf = cos_in.to(torch.float32).flatten().detach().cpu().numpy()
-#     sin_inf = sin_in.to(torch.float32).flatten().detach().cpu().numpy()
-#     of      = o.to(torch.float32).flatten().detach().cpu().numpy()
+# Write test data to file
+fn = f'{TESTNAME}_{N_SEQS}_{CHUNK_SIZE}_{D_HEAD}.txt'
+print(f"Writing to {fn}")
 
-#     for i in trange(B*H*N*D):
-#         f.write(repr(xf[i]))
-#         f.write(' ')
+with open(fn, 'w') as f:
+    # Write Q: [N_SEQS, N_HEADS, D_HEAD]
+    qf = q.flatten().detach().cpu().numpy()
+    for i in trange(len(qf), desc="Writing Q"):
+        f.write(f"{qf[i]} ")
+    f.write('\n')
 
-#     for i in trange(B*H*N*D):
-#         f.write(repr(of[i]))
-#         f.write(' ')
+    # Write K chunks: N_CHUNKS * [N_HEADS, CHUNK_SIZE, D_HEAD]
+    for chunk_idx in range(N_CHUNKS):
+        kf = k_chunks[chunk_idx].flatten().detach().cpu().numpy()
+        for i in trange(len(kf), desc=f"Writing K chunk {chunk_idx}"):
+            f.write(f"{kf[i]} ")
+        f.write('\n')
 
-#     for i in trange(N*D_2):
-#         f.write(repr(cos_inf[i]))
-#         f.write(' ')
+    # Write V chunks: N_CHUNKS * [N_HEADS, CHUNK_SIZE, D_HEAD]
+    for chunk_idx in range(N_CHUNKS):
+        vf = v_chunks[chunk_idx].flatten().detach().cpu().numpy()
+        for i in trange(len(vf), desc=f"Writing V chunk {chunk_idx}"):
+            f.write(f"{vf[i]} ")
+        f.write('\n')
 
-#     for i in trange(N*D_2):
-#         f.write(repr(sin_inf[i]))
-#         f.write(' ')
+    # Write expected outputs: N_CHUNKS * [N_HEADS, N_SEQS, D_HEAD]
+    for chunk_idx in range(N_CHUNKS):
+        of = outputs_ref[chunk_idx].flatten().detach().cpu().numpy()
+        for i in trange(len(of), desc=f"Writing O chunk {chunk_idx}"):
+            f.write(f"{of[i]} ")
+        f.write('\n')
 
-# print(f"{ro_dim=}")
+    # Write expected maxs: N_CHUNKS * [N_HEADS, N_SEQS]
+    for chunk_idx in range(N_CHUNKS):
+        mf = maxs_ref[chunk_idx].flatten().detach().cpu().numpy()
+        for i in trange(len(mf), desc=f"Writing maxs chunk {chunk_idx}"):
+            f.write(f"{mf[i]} ")
+        f.write('\n')
 
+    # Write expected sums: N_CHUNKS * [N_HEADS, N_SEQS]
+    for chunk_idx in range(N_CHUNKS):
+        sf = sums_ref[chunk_idx].flatten().detach().cpu().numpy()
+        for i in trange(len(sf), desc=f"Writing sums chunk {chunk_idx}"):
+            f.write(f"{sf[i]} ")
+        f.write('\n')
+
+print(f"Test data written to {fn}")
+print(f"Total elements written: Q={len(qf)}, K={len(kf)*N_CHUNKS}, V={len(vf)*N_CHUNKS}")
 

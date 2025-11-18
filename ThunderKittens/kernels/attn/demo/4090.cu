@@ -1,9 +1,9 @@
-#include "kittens.cuh"
+#include "../../../include/kittens.cuh"
 
 using namespace kittens;
 
 constexpr int NUM_WORKERS = 4;
-constexpr int PIPE_STAGES = 3; 
+constexpr int PIPE_STAGES = 3;
 
 template<int D> constexpr size_t ROWS = 16*(128/D); // height of each worker tile (rows)
 template<int D, typename T=bf16, typename L=row_l> using qkvo_tile = rt<T, ROWS<D>, D, L>;
@@ -14,18 +14,18 @@ template<int D> struct globals { global_layout<D> Qg, Kg, Vg, Og; };
 
 template<int D> __launch_bounds__(NUM_WORKERS*WARP_THREADS, 1)
 __global__ void attend_ker(const __grid_constant__ globals<D> g) {
-    
+
     using load_group = kittens::group<2>; // pairs of workers collaboratively load k, v tiles
     int loadid = load_group::groupid(), workerid = kittens::warpid(); // which worker am I?
     constexpr int LOAD_BLOCKS = NUM_WORKERS / load_group::GROUP_WARPS;
     const int batch = blockIdx.z, head = blockIdx.y, q_seq = blockIdx.x * NUM_WORKERS + workerid;
 
-    extern __shared__ alignment_dummy __shm[]; 
+    extern __shared__ alignment_dummy __shm[];
     shared_allocator al((int*)&__shm[0]);
-    
+
     shared_tile<D> (&k_smem)[LOAD_BLOCKS][PIPE_STAGES] = al.allocate<shared_tile<D>, LOAD_BLOCKS, PIPE_STAGES>();
     shared_tile<D> (&v_smem)[LOAD_BLOCKS][PIPE_STAGES] = al.allocate<shared_tile<D>, LOAD_BLOCKS, PIPE_STAGES>();
-    
+
     shared_tile<D> (&qo_smem)[NUM_WORKERS] = reinterpret_cast<shared_tile<D>(&)[NUM_WORKERS]>(k_smem);
     // Initialize all of the register tiles.
     qkvo_tile<D, bf16> q_reg, k_reg; // Q and K are both row layout, as we use mma_ABt.
@@ -73,14 +73,14 @@ __global__ void attend_ker(const __grid_constant__ globals<D> g) {
             int start_fill = g.Kg.depth()-first_index < ROWS<D> ? g.Kg.depth()-first_index : ROWS<D>;
             right_fill(att_block, att_block, start_fill, base_types::constants<float>::neg_infty());
             max_vec_last = max_vec;
-            max_vec = max<axis::COL>(att_block, max_vec); 
-            att_block = exp2(att_block - max_vec); 
-            max_vec_last = exp2(max_vec_last - max_vec); 
-            norm_vec *= max_vec_last; 
-            norm_vec = sum<axis::COL>(att_block, norm_vec); 
+            max_vec = max<axis::COL>(att_block, max_vec);
+            att_block = exp2(att_block - max_vec);
+            max_vec_last = exp2(max_vec_last - max_vec);
+            norm_vec *= max_vec_last;
+            norm_vec = sum<axis::COL>(att_block, norm_vec);
             att_block_mma = att_block; // copy to bf16 tile
-            load(v_reg, v_smem[subtile][tic]); 
-            o_reg *= max_vec_last; 
+            load(v_reg, v_smem[subtile][tic]);
+            o_reg *= max_vec_last;
             mma<transpose::N, transpose::N>(o_reg, att_block_mma, v_reg, o_reg);
         }
     }
