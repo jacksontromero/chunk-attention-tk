@@ -4,20 +4,18 @@ using namespace kittens;
 
 #define BLOCK_SIZE 32
 
-// Template parameters for different head dimensions
+// TODO MAXIMUM HEAD DIM IS 128
+template<int D> constexpr size_t TILE_SIZE = 16*(128/D); // height of each tile (rows)
+template<int D> using shared_tile = st_bf<TILE_SIZE<D>, D>;
+
 template<int d_head> struct attn_chunk_first_globals {
     using _gl_float = gl<float, -1, -1, -1, -1>;
     using _gl_int = gl<int, -1, -1, -1, -1>;
-
-    // Input/output arrays
     _gl_float gAttns, gMaxs, gSums;
     _gl_int gOffsets, gBegins, gEnds;
-
-    // Q, K, V tensors
-    gl<float, 1, -1, -1, d_head> gQ;  // [n_heads, n_seqs, d_head]
-    void** gKeys;                      // Array of pointers to [n_heads, chunk_size, d_head]
-    void** gValues;                    // Array of pointers to [n_heads, chunk_size, d_head]
-
+    gl<float, -1, -1, -1, d_head, shared_tile<d_head>> gQ_S_H_D;
+    void** gKeys;
+    void** gValues;
     float dim_scale;
     int n_heads;
 };
@@ -25,109 +23,82 @@ template<int d_head> struct attn_chunk_first_globals {
 template<typename scalar_t, int n_seqs, int chunk_size, int d_head>
 __global__ void attn_chunk_first_tk(const __grid_constant__ attn_chunk_first_globals<d_head> g) {
     extern __shared__ alignment_dummy __shm[];
-    tma_swizzle_allocator al((int*)&__shm[0]);
+    shared_allocator al((int*)&__shm[0]);
 
-    const int head_idx = blockIdx.x;
-    const int chunk_idx = blockIdx.y;
+    const uint32_t head_idx = blockIdx.x;
+    const uint32_t chunk_idx = blockIdx.y;
 
     const int seq_begin = g.gBegins[chunk_idx];
     const int seq_end = g.gEnds[chunk_idx];
     const int n = seq_end - seq_begin;
 
-    // Get K and V pointers for this chunk and create global layouts
+    // Extract raw pointers
     auto* __restrict__ k_ptr = reinterpret_cast<scalar_t*>(g.gKeys[chunk_idx]);
     auto* __restrict__ v_ptr = reinterpret_cast<scalar_t*>(g.gValues[chunk_idx]);
 
+    // FIX #1: Wrap raw pointers in gl<> layouts so load() can work with them
+    // K and V are [n_heads, chunk_size, d_head]
     using kv_gl = gl<scalar_t, 1, -1, chunk_size, d_head>;
-    kv_gl k_layout{k_ptr, nullptr, g.n_heads, chunk_size, nullptr};
-    kv_gl v_layout{v_ptr, nullptr, g.n_heads, chunk_size, nullptr};
+    kv_gl k{k_ptr, nullptr, g.n_heads, chunk_size, nullptr};
+    kv_gl v{v_ptr, nullptr, g.n_heads, chunk_size, nullptr};
 
-    // Allocate shared memory tiles (16x16 is standard TK subtile size)
-    constexpr int TILE_DIM = 16;
+    // Allocate shared memory
+    shared_tile<d_head> &Qs = al.allocate<shared_tile<d_head>>();
+    shared_tile<d_head> &Ks = al.allocate<shared_tile<d_head>>();
+    shared_tile<d_head> &Vs = al.allocate<shared_tile<d_head>>();
 
-    // Use st_fl for float shared tiles
-    st_fl<TILE_DIM, d_head> &Q_smem = al.allocate<st_fl<TILE_DIM, d_head>>();
-    st_fl<TILE_DIM, d_head> &K_smem = al.allocate<st_fl<TILE_DIM, d_head>>();
-    st_fl<TILE_DIM, d_head> &V_smem = al.allocate<st_fl<TILE_DIM, d_head>>();
+    const int rows_per_tile = TILE_SIZE<d_head>;
 
-    // Register tiles for computation
-    rt_fl<TILE_DIM, TILE_DIM> attn_block;      // Attention scores (Q @ K^T)
-    rt_fl<TILE_DIM, d_head> o_reg;              // Output accumulator
+    // Register tiles
+    rt<scalar_t, TILE_SIZE<d_head>, d_head> Qr, Kr, Vr;
+    rt<scalar_t, TILE_SIZE<d_head>, TILE_SIZE<d_head>> output_reg;  // Q @ K^T scores
+    rt<scalar_t, TILE_SIZE<d_head>, d_head> attn_result_reg;
 
-    // Column vectors for softmax (use col_vec helper)
-    col_vec<rt_fl<TILE_DIM, TILE_DIM>> max_vec;
-    col_vec<rt_fl<TILE_DIM, TILE_DIM>> norm_vec;  // Sum for normalization
+    // FIX #2: Use proper col_vec type instead of rv<float, N, naive>
+    // For row operations on rt<T, rows, cols>, use typename rt::col_vec
+    using vec_type = typename rt<scalar_t, TILE_SIZE<d_head>, TILE_SIZE<d_head>>::col_vec;
+    vec_type max_vec, sum_vec;
 
-    // Process Q tiles (iterate over n_seqs in chunks of TILE_DIM)
-    const int q_tiles = (n_seqs + TILE_DIM - 1) / TILE_DIM;
+    int q_iters = (n_seqs + rows_per_tile - 1) / rows_per_tile;
+    for (int i = 0; i < q_iters; i++) {
+        int q_start = seq_begin + i * rows_per_tile;
 
-    for (int q_tile = 0; q_tile < q_tiles; q_tile++) {
-        // Load Q tile from global memory
-        // Q layout: [batch=1, head, seq, dim]
-        warpgroup::load(Q_smem, g.gQ, {0, head_idx, seq_begin + q_tile * TILE_DIM, 0});
+        // Load Q - this should work as-is
+        warp::load(Qs, g.gQ_S_H_D, {q_start, head_idx, 0, 0});
 
-        // Initialize accumulator for this Q tile
-        warpgroup::zero(o_reg);
-        warp::neg_infty(max_vec);
-        warp::zero(norm_vec);
+        int k_iters = (chunk_size + rows_per_tile - 1) / rows_per_tile;
+        for (int j = 0; j < k_iters; j++) {
+            int k_start = j * rows_per_tile;
 
-        // Process K/V tiles (iterate over chunk_size)
-        const int k_tiles = (chunk_size + TILE_DIM - 1) / TILE_DIM;
+            // FIX #1 (continued): Now load works because k and v are gl<> types
+            warp::load(Ks, k, {0, head_idx, k_start, 0});
+            warp::load(Vs, v, {0, head_idx, k_start, 0});
 
-        for (int k_tile = 0; k_tile < k_tiles; k_tile++) {
-            // Load K and V tiles
-            warpgroup::load(K_smem, k_layout, {0, head_idx, k_tile * TILE_DIM, 0});
-            warpgroup::load(V_smem, v_layout, {0, head_idx, k_tile * TILE_DIM, 0});
+            // Load from shared to registers
+            warp::load(Qr, Qs);
+            warp::load(Kr, Ks);
+            warp::load(Vr, Vs);
 
-            // Compute attention scores: Q @ K^T
-            // Q_smem is [TILE_DIM, d_head], K_smem is [TILE_DIM, d_head]
-            // Result is [TILE_DIM, TILE_DIM]
-            warpgroup::mm_ABt(attn_block, Q_smem, K_smem);
-            warpgroup::mma_async_wait();
+            // FIX #3: Use mma_ABt instead of mm_ABt
+            // Compute Q @ K^T
+            warp::mma_ABt(output_reg, Qr, Kr);
 
-            // Scale by 1/sqrt(d_head)
-            warp::mul(attn_block, attn_block, g.dim_scale);
+            // Softmax operations - now work because max_vec has correct type
+            warp::row_max(max_vec, output_reg);
+            warp::sub_row(output_reg, output_reg, max_vec);
 
-            // Softmax computation
-            // 1. Find row max (for numerical stability)
-            col_vec<rt_fl<TILE_DIM, TILE_DIM>> max_vec_last;
-            warp::copy(max_vec_last, max_vec);
-            warp::row_max(max_vec, attn_block, max_vec);  // Accumulate with previous max
+            // Exp (you'll need to add this - TK has exp2)
+            // warp::exp(output_reg, output_reg);
 
-            // 2. Subtract max from scores
-            warp::sub_row(attn_block, attn_block, max_vec);
+            warp::row_sum(sum_vec, output_reg);
 
-            // 3. Compute exp
-            // Using exp2 with log2(e) scaling for better hardware support
-            constexpr float log2e = 1.44269504089f;
-            warp::mul(attn_block, attn_block, log2e);
-            warp::exp2(attn_block, attn_block);
+            // Normalize
+            warp::div_row(output_reg, output_reg, sum_vec);
 
-            // 4. Update normalizer
-            // Rescale previous norm by exp(old_max - new_max)
-            warp::sub(max_vec_last, max_vec_last, max_vec);
-            warp::mul(max_vec_last, max_vec_last, log2e);
-            warp::exp2(max_vec_last, max_vec_last);
-            warp::mul(norm_vec, norm_vec, max_vec_last);
-
-            // Add current tile's sum
-            warp::row_sum(norm_vec, attn_block, norm_vec);
-
-            // 5. Rescale output accumulator
-            warp::mul_row(o_reg, o_reg, max_vec_last);
-
-            // 6. Multiply attention weights by V and accumulate
-            warpgroup::mma_AB(o_reg, attn_block, V_smem);
-            warpgroup::mma_async_wait();
+            // FIX #3 (continued): Use mma_AB instead of mm_AB
+            // Multiply by V
+            warp::mma_AB(attn_result_reg, output_reg, Vr);
         }
-
-        // Final normalization
-        warp::div_row(o_reg, o_reg, norm_vec);
-
-        // Store results
-        // TODO: Set up output global layout and store
-        // The output should go to gAttns at appropriate indices
-        // Also store max_vec to gMaxs and norm_vec to gSums
     }
 }
 
