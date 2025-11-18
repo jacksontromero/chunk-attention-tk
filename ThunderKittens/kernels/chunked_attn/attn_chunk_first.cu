@@ -34,20 +34,51 @@ __global__ void attn_chunk_first_tk(const __grid_constant__ attn_chunk_first_glo
     const int seq_end = g.gEnds[chunk_idx];
     const int n = seq_end - seq_begin;
 
-    auto* __restrict__ k = reinterpret_cast<bf16*>(g.gKeys[chunk_idx]);
-    auto* __restrict__ v = reinterpret_cast<bf16*>(g.gValues[chunk_idx]);
-
     st<bf16, n_seqs, d_head> &Qs = al.allocate<st<bf16, n_seqs, d_head>>();
     st<bf16, chunk_size, d_head> &Ks = al.allocate<st<bf16, chunk_size, d_head>>();
     // todo this can reuse Ks
     st<bf16, chunk_size, d_head> &Vs = al.allocate<st<bf16, chunk_size, d_head>>();
 
-    // thread block process a [n_seqs, d_head] tile of Q starting from q+q_row_offset with stride n_heads * d_head
-    // thread block processes a [chunk_size, d_head] tile of K starting from k + kv_row_offset with stride d_head
-
     warp::load(Qs, g.gQ_1_S_H_D, {0, seq_begin, head_idx, 0});
-    warp::load(Ks, k, {head_idx, 0, 0});
-    warp::load(Vs, v, {head_idx, 0, 0});
+
+    // Calculate offset - same as kernel_cuda.cu line 751
+    const uint32_t kv_row_offset = head_idx * chunk_size * d_head;
+    bf16* k_ptr = reinterpret_cast<bf16*>(g.gKeys[chunk_idx]) + kv_row_offset;
+    bf16* v_ptr = reinterpret_cast<bf16*>(g.gValues[chunk_idx]) + kv_row_offset;
+
+    // Vectorized load K into shared memory
+    int elems_per_load = sizeof(float4) / sizeof(bf16);  // 8 elements
+    int total_elems = chunk_size * d_head;
+    int total_loads = (total_elems + blockDim.x * elems_per_load - 1) / (blockDim.x * elems_per_load);
+
+    for (int i = 0; i < total_loads; i++) {
+        int load_idx = i * blockDim.x + threadIdx.x;
+        int elem_idx = load_idx * elems_per_load;
+
+        if (elem_idx < total_elems) {
+            int row = elem_idx / d_head;
+            int col = elem_idx % d_head;
+
+            // Load 8 bf16 elements (float4) at a time
+            *reinterpret_cast<float4*>(&Ks[row * d_head + col]) =
+                *reinterpret_cast<const float4*>(&k_ptr[row * d_head + col]);
+        }
+    }
+
+    // Vectorized load V into shared memory
+    for (int i = 0; i < total_loads; i++) {
+        int load_idx = i * blockDim.x + threadIdx.x;
+        int elem_idx = load_idx * elems_per_load;
+
+        if (elem_idx < total_elems) {
+            int row = elem_idx / d_head;
+            int col = elem_idx % d_head;
+
+            // Load 8 bf16 elements (float4) at a time
+            *reinterpret_cast<float4*>(&Vs[row * d_head + col]) =
+                *reinterpret_cast<const float4*>(&v_ptr[row * d_head + col]);
+        }
+    }
 
     __syncthreads();
 
