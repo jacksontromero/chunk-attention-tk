@@ -4,72 +4,131 @@ using namespace kittens;
 
 #define BLOCK_SIZE 32
 
-// TODO MAXIMUM HEAD DIM IS 128
-template<int D> constexpr size_t TILE_SIZE = 16*(128/D); // height of each tile (rows)
-template<int D> using shared_tile = st_bf<TILE_SIZE<D>, D>;
+// Template parameters for different head dimensions
 template<int d_head> struct attn_chunk_first_globals {
     using _gl_float = gl<float, -1, -1, -1, -1>;
     using _gl_int = gl<int, -1, -1, -1, -1>;
+
+    // Input/output arrays
     _gl_float gAttns, gMaxs, gSums;
     _gl_int gOffsets, gBegins, gEnds;
-    gl<float, -1, -1, -1, d_head, shared_tile<d_head>> gQ_S_H_D;
-    void** gKeys;
-    void** gValues;
+
+    // Q, K, V tensors
+    gl<float, 1, -1, -1, d_head> gQ;  // [n_heads, n_seqs, d_head]
+    void** gKeys;                      // Array of pointers to [n_heads, chunk_size, d_head]
+    void** gValues;                    // Array of pointers to [n_heads, chunk_size, d_head]
+
     float dim_scale;
     int n_heads;
 };
 
-template<int n_seqs, int chunk_size, int d_head>
+template<typename scalar_t, int n_seqs, int chunk_size, int d_head>
 __global__ void attn_chunk_first_tk(const __grid_constant__ attn_chunk_first_globals<d_head> g) {
     extern __shared__ alignment_dummy __shm[];
-    shared_allocator al((int*)&__shm[0]);
+    tma_swizzle_allocator al((int*)&__shm[0]);
 
-    const uint32_t head_idx = blockIdx.x;
-    const uint32_t chunk_idx = blockIdx.y;
+    const int head_idx = blockIdx.x;
+    const int chunk_idx = blockIdx.y;
 
     const int seq_begin = g.gBegins[chunk_idx];
     const int seq_end = g.gEnds[chunk_idx];
     const int n = seq_end - seq_begin;
 
-    // const int n_heads = g.n_heads;
-    // const int* offsets = g.gOffsets;
+    // Get K and V pointers for this chunk and create global layouts
+    auto* __restrict__ k_ptr = reinterpret_cast<scalar_t*>(g.gKeys[chunk_idx]);
+    auto* __restrict__ v_ptr = reinterpret_cast<scalar_t*>(g.gValues[chunk_idx]);
 
-    // const uint32_t q_row_offset = seq_begin * n_heads * d_head + head_idx * d_head;
-    // const uint32_t kv_row_offset = head_idx * chunk_size * d_head;
-    // const int result_offset = offsets[chunk_idx];
-    // const uint32_t max_sum_offset = result_offset * n_heads + head_idx * n;
-    // const uint32_t attn_offset = max_sum_offset * d_head;
+    using kv_gl = gl<scalar_t, 1, -1, chunk_size, d_head>;
+    kv_gl k_layout{k_ptr, nullptr, g.n_heads, chunk_size, nullptr};
+    kv_gl v_layout{v_ptr, nullptr, g.n_heads, chunk_size, nullptr};
 
-    auto* __restrict__ k = reinterpret_cast<float*>(g.gKeys[chunk_idx]);
+    // Allocate shared memory tiles (16x16 is standard TK subtile size)
+    constexpr int TILE_DIM = 16;
 
-    shared_tile<d_head> &Qs = al.allocate<shared_tile<d_head>>();
-    shared_tile<d_head> &Ks = al.allocate<shared_tile<d_head>>();
-    const int rows_per_tile = TILE_SIZE<d_head>;
+    // Use st_fl for float shared tiles
+    st_fl<TILE_DIM, d_head> &Q_smem = al.allocate<st_fl<TILE_DIM, d_head>>();
+    st_fl<TILE_DIM, d_head> &K_smem = al.allocate<st_fl<TILE_DIM, d_head>>();
+    st_fl<TILE_DIM, d_head> &V_smem = al.allocate<st_fl<TILE_DIM, d_head>>();
 
-    // thread block process a [n_seqs, d_head] tile of Q starting from q+q_row_offset with stride n_heads * d_head
-    // thread block processes a [chunk_size, d_head] tile of K starting from k + kv_row_offset with stride d_head
+    // Register tiles for computation
+    rt_fl<TILE_DIM, TILE_DIM> attn_block;      // Attention scores (Q @ K^T)
+    rt_fl<TILE_DIM, d_head> o_reg;              // Output accumulator
 
-    int q_iters = (n_seqs + rows_per_tile - 1) / rows_per_tile;
-    for (int i = 0; i < q_iters; i++) {
-        int q_start = seq_begin + i * rows_per_tile;
-        load(Qs, g.gQ_S_H_D, {q_start, head_idx, 0, 0});
+    // Column vectors for softmax (use col_vec helper)
+    col_vec<rt_fl<TILE_DIM, TILE_DIM>> max_vec;
+    col_vec<rt_fl<TILE_DIM, TILE_DIM>> norm_vec;  // Sum for normalization
 
-        int k_iters = (chunk_size + rows_per_tile - 1) / rows_per_tile;
-        for (int j = 0; j < k_iters; j++) {
-            int k_start = j * rows_per_tile;
-            load(Ks, k, {head_idx, k_start, 0});
+    // Process Q tiles (iterate over n_seqs in chunks of TILE_DIM)
+    const int q_tiles = (n_seqs + TILE_DIM - 1) / TILE_DIM;
 
+    for (int q_tile = 0; q_tile < q_tiles; q_tile++) {
+        // Load Q tile from global memory
+        // Q layout: [batch=1, head, seq, dim]
+        warpgroup::load(Q_smem, g.gQ, {0, head_idx, seq_begin + q_tile * TILE_DIM, 0});
+
+        // Initialize accumulator for this Q tile
+        warpgroup::zero(o_reg);
+        warp::neg_infty(max_vec);
+        warp::zero(norm_vec);
+
+        // Process K/V tiles (iterate over chunk_size)
+        const int k_tiles = (chunk_size + TILE_DIM - 1) / TILE_DIM;
+
+        for (int k_tile = 0; k_tile < k_tiles; k_tile++) {
+            // Load K and V tiles
+            warpgroup::load(K_smem, k_layout, {0, head_idx, k_tile * TILE_DIM, 0});
+            warpgroup::load(V_smem, v_layout, {0, head_idx, k_tile * TILE_DIM, 0});
+
+            // Compute attention scores: Q @ K^T
+            // Q_smem is [TILE_DIM, d_head], K_smem is [TILE_DIM, d_head]
+            // Result is [TILE_DIM, TILE_DIM]
+            warpgroup::mm_ABt(attn_block, Q_smem, K_smem);
+            warpgroup::mma_async_wait();
+
+            // Scale by 1/sqrt(d_head)
+            warp::mul(attn_block, attn_block, g.dim_scale);
+
+            // Softmax computation
+            // 1. Find row max (for numerical stability)
+            col_vec<rt_fl<TILE_DIM, TILE_DIM>> max_vec_last;
+            warp::copy(max_vec_last, max_vec);
+            warp::row_max(max_vec, attn_block, max_vec);  // Accumulate with previous max
+
+            // 2. Subtract max from scores
+            warp::sub_row(attn_block, attn_block, max_vec);
+
+            // 3. Compute exp
+            // Using exp2 with log2(e) scaling for better hardware support
+            constexpr float log2e = 1.44269504089f;
+            warp::mul(attn_block, attn_block, log2e);
+            warp::exp2(attn_block, attn_block);
+
+            // 4. Update normalizer
+            // Rescale previous norm by exp(old_max - new_max)
+            warp::sub(max_vec_last, max_vec_last, max_vec);
+            warp::mul(max_vec_last, max_vec_last, log2e);
+            warp::exp2(max_vec_last, max_vec_last);
+            warp::mul(norm_vec, norm_vec, max_vec_last);
+
+            // Add current tile's sum
+            warp::row_sum(norm_vec, attn_block, norm_vec);
+
+            // 5. Rescale output accumulator
+            warp::mul_row(o_reg, o_reg, max_vec_last);
+
+            // 6. Multiply attention weights by V and accumulate
+            warpgroup::mma_AB(o_reg, attn_block, V_smem);
+            warpgroup::mma_async_wait();
         }
+
+        // Final normalization
+        warp::div_row(o_reg, o_reg, norm_vec);
+
+        // Store results
+        // TODO: Set up output global layout and store
+        // The output should go to gAttns at appropriate indices
+        // Also store max_vec to gMaxs and norm_vec to gSums
     }
 }
-
-// Q: [n_seqs, d_head] w/ stride n_heads * d_head. COULD get [tile, d_head]
-// K: [chunk_size, d_head] w/ stride d_head. COULD get [tile, d_head]
-
-// NOTES:
-// - In kernel_cuda, it's assumed that n_seqs*chunk_size fits in shared memory. We should make the same assumption here.
-// - Need to figure out if K is row or column layout - changes best loading strategy.
-// - Maybe we should just get a working version that assumes everything fits in shared memory? Honestly a good idea ngl
-
 
 #include "harness.impl"
