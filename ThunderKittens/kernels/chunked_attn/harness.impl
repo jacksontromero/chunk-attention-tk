@@ -108,9 +108,9 @@ int main(int argc, char **argv) {
     std::cout << "Test data loaded successfully!" << std::endl;
 
     // Allocate device memory
-    float *d_q;
-    float *d_k[N_CHUNKS];
-    float *d_v[N_CHUNKS];
+    bf16 *d_q;
+    bf16 *d_k[N_CHUNKS];
+    bf16 *d_v[N_CHUNKS];
     float *d_attns;
     float *d_maxs;
     float *d_sums;
@@ -167,14 +167,13 @@ int main(int argc, char **argv) {
     cudaMemcpy(d_offsets, h_offsets, N_CHUNKS * sizeof(int), cudaMemcpyHostToDevice);
 
     // Setup globals for kernel
-    using scalar_t = float;
-    using globals_t = attn_chunk_first_globals<scalar_t, N_SEQS, D_HEAD>;
+    using globals_t = attn_chunk_first_globals<N_SEQS, D_HEAD>;
 
     // Construct gl objects first
-    auto gQ = gl<scalar_t, 1, N_SEQS, -1, D_HEAD, st<scalar_t, N_SEQS, D_HEAD>>(
+    auto gQ = gl<bf16, 1, N_SEQS, -1, D_HEAD, st<bf16, N_SEQS, D_HEAD>>(
         d_q, nullptr, nullptr, N_HEADS, nullptr);
 
-    auto gAttns = gl<scalar_t, -1, -1, -1, -1>(
+    auto gAttns = gl<float, -1, -1, -1, -1>(
         d_attns, 1, 1, N_CHUNKS * N_HEADS * N_SEQS, D_HEAD);
 
     auto gMaxs = gl<float, -1, -1, -1, -1>(
@@ -207,14 +206,14 @@ int main(int argc, char **argv) {
         .n_heads = N_HEADS
     };
 
-    // Calculate shared memory size
-    size_t shared_mem_size = sizeof(st<scalar_t, N_SEQS, D_HEAD>) * 4 +  // Qs, Ks, Vs, output
-                             sizeof(st<scalar_t, N_SEQS, CHUNK_SIZE>);     // additional output tile
+    // Calculate shared memory size (TODO COME BACK TO THIS)
+    size_t shared_mem_size = sizeof(st<bf16, N_SEQS, D_HEAD>) * 3 +  // Qs, Ks, Vs, output
+                             sizeof(st<bf16, N_SEQS, CHUNK_SIZE>);     // additional output tile
     std::cout << "Shared memory size: " << shared_mem_size << " bytes" << std::endl;
 
     // Set kernel attributes
     cudaFuncSetAttribute(
-        attn_chunk_first_tk<scalar_t, N_SEQS, CHUNK_SIZE, D_HEAD>,
+        attn_chunk_first_tk<N_SEQS, CHUNK_SIZE, D_HEAD>,
         cudaFuncAttributeMaxDynamicSharedMemorySize,
         shared_mem_size
     );
@@ -228,7 +227,7 @@ int main(int argc, char **argv) {
     cudaDeviceSynchronize();
     const auto start = std::chrono::high_resolution_clock::now();
 
-    attn_chunk_first_tk<scalar_t, N_SEQS, CHUNK_SIZE, D_HEAD><<<grid, block, shared_mem_size>>>(g);
+    attn_chunk_first_tk<N_SEQS, CHUNK_SIZE, D_HEAD><<<grid, block, shared_mem_size>>>(g);
 
     cudaDeviceSynchronize();
     const auto finish = std::chrono::high_resolution_clock::now();
