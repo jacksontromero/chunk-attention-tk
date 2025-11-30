@@ -1,154 +1,58 @@
 #!/bin/bash
-# Run all tests and summarize results
+# Fast parallel test runner with streaming output
 
-PASSED=0
-FAILED=0
-FAILED_TESTS=""
+# Number of parallel jobs (adjust based on GPU memory)
+PARALLEL_JOBS=${PARALLEL_JOBS:-4}
 
-./attn_chunk_first identity_v_16_64_128.txt > /tmp/test_out.txt 2>&1
-if [ $? -eq 0 ]; then
-    echo "✓ identity_v_16_64_128.txt"
-    ((PASSED++))
-else
-    echo "✗ identity_v_16_64_128.txt"
-    ((FAILED++))
-    FAILED_TESTS="$FAILED_TESTS identity_v_16_64_128.txt"
-fi
+# Get list of test files
+TESTS=(tests/*.txt)
+TOTAL=${#TESTS[@]}
 
-./attn_chunk_first large_16_64_128.txt > /tmp/test_out.txt 2>&1
-if [ $? -eq 0 ]; then
-    echo "✓ large_16_64_128.txt"
-    ((PASSED++))
-else
-    echo "✗ large_16_64_128.txt"
-    ((FAILED++))
-    FAILED_TESTS="$FAILED_TESTS large_16_64_128.txt"
-fi
+echo "Running $TOTAL tests with $PARALLEL_JOBS parallel jobs..."
+echo ""
 
-./attn_chunk_first negative_16_64_128.txt > /tmp/test_out.txt 2>&1
-if [ $? -eq 0 ]; then
-    echo "✓ negative_16_64_128.txt"
-    ((PASSED++))
-else
-    echo "✗ negative_16_64_128.txt"
-    ((FAILED++))
-    FAILED_TESTS="$FAILED_TESTS negative_16_64_128.txt"
-fi
+# Temp file for results
+RESULTS_FILE=$(mktemp)
+trap "rm -f $RESULTS_FILE" EXIT
 
-./attn_chunk_first ones_16_64_128.txt > /tmp/test_out.txt 2>&1
-if [ $? -eq 0 ]; then
-    echo "✓ ones_16_64_128.txt"
-    ((PASSED++))
-else
-    echo "✗ ones_16_64_128.txt"
-    ((FAILED++))
-    FAILED_TESTS="$FAILED_TESTS ones_16_64_128.txt"
-fi
+# Function to run a single test
+run_test() {
+    local TEST_FILE="$1"
+    local TEST_NAME=$(basename "$TEST_FILE")
 
-./attn_chunk_first positive_16_64_128.txt > /tmp/test_out.txt 2>&1
-if [ $? -eq 0 ]; then
-    echo "✓ positive_16_64_128.txt"
-    ((PASSED++))
-else
-    echo "✗ positive_16_64_128.txt"
-    ((FAILED++))
-    FAILED_TESTS="$FAILED_TESTS positive_16_64_128.txt"
-fi
+    # Run test, capture output in memory
+    OUTPUT=$(./attn_chunk_first "$TEST_FILE" 2>&1)
+    EXIT_CODE=$?
 
-./attn_chunk_first randn_16_64_128.txt > /tmp/test_out.txt 2>&1
-if [ $? -eq 0 ]; then
-    echo "✓ randn_16_64_128.txt"
-    ((PASSED++))
-else
-    echo "✗ randn_16_64_128.txt"
-    ((FAILED++))
-    FAILED_TESTS="$FAILED_TESTS randn_16_64_128.txt"
-fi
+    if [ $EXIT_CODE -eq 0 ]; then
+        echo "✓ $TEST_NAME"
+        echo "PASS" >> "$RESULTS_FILE"
+    else
+        # Extract summary
+        SUMMARY=$(echo "$OUTPUT" | grep "^SUMMARY:" | head -1)
+        echo "✗ $TEST_NAME - ${SUMMARY#SUMMARY: }"
+        echo "FAIL:$TEST_NAME" >> "$RESULTS_FILE"
+    fi
+}
+export -f run_test
+export RESULTS_FILE
 
-./attn_chunk_first seed1000_16_64_128.txt > /tmp/test_out.txt 2>&1
-if [ $? -eq 0 ]; then
-    echo "✓ seed1000_16_64_128.txt"
-    ((PASSED++))
-else
-    echo "✗ seed1000_16_64_128.txt"
-    ((FAILED++))
-    FAILED_TESTS="$FAILED_TESTS seed1000_16_64_128.txt"
-fi
+# Run tests in parallel, output streams as jobs complete
+printf '%s\n' "${TESTS[@]}" | xargs -P $PARALLEL_JOBS -I {} bash -c 'run_test "$@"' _ {}
 
-./attn_chunk_first seed123_16_64_128.txt > /tmp/test_out.txt 2>&1
-if [ $? -eq 0 ]; then
-    echo "✓ seed123_16_64_128.txt"
-    ((PASSED++))
-else
-    echo "✗ seed123_16_64_128.txt"
-    ((FAILED++))
-    FAILED_TESTS="$FAILED_TESTS seed123_16_64_128.txt"
-fi
-
-./attn_chunk_first seed2000_16_64_128.txt > /tmp/test_out.txt 2>&1
-if [ $? -eq 0 ]; then
-    echo "✓ seed2000_16_64_128.txt"
-    ((PASSED++))
-else
-    echo "✗ seed2000_16_64_128.txt"
-    ((FAILED++))
-    FAILED_TESTS="$FAILED_TESTS seed2000_16_64_128.txt"
-fi
-
-./attn_chunk_first seed456_16_64_128.txt > /tmp/test_out.txt 2>&1
-if [ $? -eq 0 ]; then
-    echo "✓ seed456_16_64_128.txt"
-    ((PASSED++))
-else
-    echo "✗ seed456_16_64_128.txt"
-    ((FAILED++))
-    FAILED_TESTS="$FAILED_TESTS seed456_16_64_128.txt"
-fi
-
-./attn_chunk_first seed789_16_64_128.txt > /tmp/test_out.txt 2>&1
-if [ $? -eq 0 ]; then
-    echo "✓ seed789_16_64_128.txt"
-    ((PASSED++))
-else
-    echo "✗ seed789_16_64_128.txt"
-    ((FAILED++))
-    FAILED_TESTS="$FAILED_TESTS seed789_16_64_128.txt"
-fi
-
-./attn_chunk_first small_16_64_128.txt > /tmp/test_out.txt 2>&1
-if [ $? -eq 0 ]; then
-    echo "✓ small_16_64_128.txt"
-    ((PASSED++))
-else
-    echo "✗ small_16_64_128.txt"
-    ((FAILED++))
-    FAILED_TESTS="$FAILED_TESTS small_16_64_128.txt"
-fi
-
-./attn_chunk_first uniform_16_64_128.txt > /tmp/test_out.txt 2>&1
-if [ $? -eq 0 ]; then
-    echo "✓ uniform_16_64_128.txt"
-    ((PASSED++))
-else
-    echo "✗ uniform_16_64_128.txt"
-    ((FAILED++))
-    FAILED_TESTS="$FAILED_TESTS uniform_16_64_128.txt"
-fi
-
-./attn_chunk_first zeros_v_16_64_128.txt > /tmp/test_out.txt 2>&1
-if [ $? -eq 0 ]; then
-    echo "✓ zeros_v_16_64_128.txt"
-    ((PASSED++))
-else
-    echo "✗ zeros_v_16_64_128.txt"
-    ((FAILED++))
-    FAILED_TESTS="$FAILED_TESTS zeros_v_16_64_128.txt"
-fi
+# Count results
+PASSED=$(grep -c "^PASS" "$RESULTS_FILE" 2>/dev/null || echo 0)
+FAILED=$(grep -c "^FAIL" "$RESULTS_FILE" 2>/dev/null || echo 0)
 
 echo ""
 echo "================================"
 echo "PASSED: $PASSED / $((PASSED + FAILED))"
+
 if [ $FAILED -gt 0 ]; then
-    echo "FAILED:$FAILED_TESTS"
+    echo ""
+    echo "Failed tests:"
+    grep "^FAIL:" "$RESULTS_FILE" | cut -d: -f2 | sed 's/^/  /'
     exit 1
+else
+    echo "All tests passed!"
 fi

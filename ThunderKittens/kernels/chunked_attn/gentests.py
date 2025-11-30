@@ -3,9 +3,10 @@
 Test generator for chunked attention TK kernel.
 
 Usage:
-    python gentests.py                 # Generate all tests
-    python gentests.py randn           # Generate single test
-    python gentests.py --list          # List available tests
+    python gentests.py                      # Generate full test grid
+    python gentests.py --quick              # Quick test set (fewer configs)
+    python gentests.py randn 8 4 2          # Single test: pattern n_seqs n_heads n_chunks
+    python gentests.py --list               # List available data patterns
 """
 
 import torch
@@ -14,190 +15,220 @@ import sys
 import math
 import os
 from pathlib import Path
+from multiprocessing import Pool, cpu_count
+from functools import partial
+import time
 
-# Test configuration - must match harness.impl compile-time constants
-N_SEQS = 16
+# Fixed at compile time (must match harness.impl)
 CHUNK_SIZE = 64
 D_HEAD = 128
-N_HEADS = 4
-N_CHUNKS = 2
+MAX_N_SEQS = 32
 
-QUIET = True  # Suppress per-element progress bars
+# Directories
+TEST_DIR = Path("tests")
+OUTPUT_DIR = Path("output")
+
+# Number of parallel workers
+N_WORKERS = min(cpu_count(), 16)
 
 
-def compute_chunk_attention(q, k_chunks, v_chunks, softmax_scale):
-    """Reference implementation matching attn_chunk_first_kernel_v2."""
+def compute_chunk_attention_cpu(q, k_chunks, v_chunks, softmax_scale):
+    """Reference implementation - CPU version for parallel generation."""
     outputs, maxs, sums = [], [], []
+    n_heads = q.shape[1]
 
     for k_chunk, v_chunk in zip(k_chunks, v_chunks):
         chunk_out, chunk_max, chunk_sum = [], [], []
-        for h in range(q.shape[1]):
-            scores = torch.matmul(q[:, h, :], k_chunk[h].T) * softmax_scale
-            max_s = scores.max(dim=1, keepdim=True)[0]
-            exp_s = torch.exp(scores - max_s)
-            sum_s = exp_s.sum(dim=1, keepdim=True)
-            out = torch.matmul(exp_s, v_chunk[h])
+        for h in range(n_heads):
+            scores = np.matmul(q[:, h, :], k_chunk[h].T) * softmax_scale
+            max_s = scores.max(axis=1, keepdims=True)
+            exp_s = np.exp(scores - max_s)
+            sum_s = exp_s.sum(axis=1, keepdims=True)
+            out = np.matmul(exp_s, v_chunk[h])
             chunk_out.append(out)
-            chunk_max.append(max_s.squeeze())
-            chunk_sum.append(sum_s.squeeze())
-        outputs.append(torch.stack(chunk_out))
-        maxs.append(torch.stack(chunk_max))
-        sums.append(torch.stack(chunk_sum))
+            chunk_max.append(max_s.squeeze(-1))
+            chunk_sum.append(sum_s.squeeze(-1))
+        outputs.append(np.stack(chunk_out))
+        maxs.append(np.stack(chunk_max))
+        sums.append(np.stack(chunk_sum))
 
     return outputs, maxs, sums
 
 
-def write_test_file(filename, q, k_chunks, v_chunks, outputs, maxs, sums):
-    """Write test data to file."""
-    with open(filename, 'w') as f:
-        # Q, K chunks, V chunks, outputs, maxs, sums
+def write_test_file(filepath, n_seqs, n_heads, n_chunks, q, k_chunks, v_chunks, outputs, maxs, sums):
+    """Write test data with header."""
+    filepath.parent.mkdir(parents=True, exist_ok=True)
+    with open(filepath, 'w') as f:
+        f.write(f'{n_seqs} {CHUNK_SIZE} {D_HEAD} {n_heads} {n_chunks}\n')
         for arr in [q] + k_chunks + v_chunks + outputs + maxs + sums:
-            data = arr.flatten().detach().cpu().numpy()
+            data = arr.flatten()
             f.write(' '.join(f'{x}' for x in data) + '\n')
 
 
 # =============================================================================
-# Test case definitions
+# Data pattern generators (CPU/numpy versions for parallelism)
 # =============================================================================
 
-TEST_CASES = {}
-
-def register_test(name):
-    """Decorator to register a test case."""
-    def decorator(fn):
-        TEST_CASES[name] = fn
-        return fn
-    return decorator
-
-
-@register_test('randn')
-def test_randn(seed=42):
-    """Standard random normal."""
-    torch.manual_seed(seed)
-    q = torch.randn((N_SEQS, N_HEADS, D_HEAD), dtype=torch.float32, device='cuda')
-    k = [torch.randn((N_HEADS, CHUNK_SIZE, D_HEAD), dtype=torch.float32, device='cuda') for _ in range(N_CHUNKS)]
-    v = [torch.randn((N_HEADS, CHUNK_SIZE, D_HEAD), dtype=torch.float32, device='cuda') for _ in range(N_CHUNKS)]
+def pattern_randn(n_seqs, n_heads, n_chunks, seed=42):
+    rng = np.random.RandomState(seed)
+    q = rng.randn(n_seqs, n_heads, D_HEAD).astype(np.float32)
+    k = [rng.randn(n_heads, CHUNK_SIZE, D_HEAD).astype(np.float32) for _ in range(n_chunks)]
+    v = [rng.randn(n_heads, CHUNK_SIZE, D_HEAD).astype(np.float32) for _ in range(n_chunks)]
     return q, k, v
 
 
-@register_test('ones')
-def test_ones(seed=42):
-    """All ones - basic sanity check."""
-    q = torch.ones((N_SEQS, N_HEADS, D_HEAD), dtype=torch.float32, device='cuda')
-    k = [torch.ones((N_HEADS, CHUNK_SIZE, D_HEAD), dtype=torch.float32, device='cuda') for _ in range(N_CHUNKS)]
-    v = [torch.ones((N_HEADS, CHUNK_SIZE, D_HEAD), dtype=torch.float32, device='cuda') for _ in range(N_CHUNKS)]
+def pattern_small(n_seqs, n_heads, n_chunks, seed=42):
+    rng = np.random.RandomState(seed)
+    q = rng.randn(n_seqs, n_heads, D_HEAD).astype(np.float32) * 0.1
+    k = [rng.randn(n_heads, CHUNK_SIZE, D_HEAD).astype(np.float32) * 0.1 for _ in range(n_chunks)]
+    v = [rng.randn(n_heads, CHUNK_SIZE, D_HEAD).astype(np.float32) * 0.1 for _ in range(n_chunks)]
     return q, k, v
 
 
-@register_test('small')
-def test_small(seed=42):
-    """Small values - less numerical issues."""
-    torch.manual_seed(seed)
-    q = torch.randn((N_SEQS, N_HEADS, D_HEAD), dtype=torch.float32, device='cuda') * 0.1
-    k = [torch.randn((N_HEADS, CHUNK_SIZE, D_HEAD), dtype=torch.float32, device='cuda') * 0.1 for _ in range(N_CHUNKS)]
-    v = [torch.randn((N_HEADS, CHUNK_SIZE, D_HEAD), dtype=torch.float32, device='cuda') * 0.1 for _ in range(N_CHUNKS)]
+def pattern_ones(n_seqs, n_heads, n_chunks, seed=42):
+    q = np.ones((n_seqs, n_heads, D_HEAD), dtype=np.float32)
+    k = [np.ones((n_heads, CHUNK_SIZE, D_HEAD), dtype=np.float32) for _ in range(n_chunks)]
+    v = [np.ones((n_heads, CHUNK_SIZE, D_HEAD), dtype=np.float32) for _ in range(n_chunks)]
     return q, k, v
 
 
-@register_test('large')
-def test_large(seed=42):
-    """Large values - stress numerical stability."""
-    torch.manual_seed(seed)
-    q = torch.randn((N_SEQS, N_HEADS, D_HEAD), dtype=torch.float32, device='cuda') * 2.0
-    k = [torch.randn((N_HEADS, CHUNK_SIZE, D_HEAD), dtype=torch.float32, device='cuda') * 2.0 for _ in range(N_CHUNKS)]
-    v = [torch.randn((N_HEADS, CHUNK_SIZE, D_HEAD), dtype=torch.float32, device='cuda') * 2.0 for _ in range(N_CHUNKS)]
+def pattern_uniform(n_seqs, n_heads, n_chunks, seed=42):
+    rng = np.random.RandomState(seed)
+    q = (rng.rand(n_seqs, n_heads, D_HEAD).astype(np.float32) * 2 - 1)
+    k = [(rng.rand(n_heads, CHUNK_SIZE, D_HEAD).astype(np.float32) * 2 - 1) for _ in range(n_chunks)]
+    v = [(rng.rand(n_heads, CHUNK_SIZE, D_HEAD).astype(np.float32) * 2 - 1) for _ in range(n_chunks)]
     return q, k, v
 
 
-@register_test('uniform')
-def test_uniform(seed=42):
-    """Uniform [-1, 1]."""
-    torch.manual_seed(seed)
-    q = torch.rand((N_SEQS, N_HEADS, D_HEAD), dtype=torch.float32, device='cuda') * 2 - 1
-    k = [torch.rand((N_HEADS, CHUNK_SIZE, D_HEAD), dtype=torch.float32, device='cuda') * 2 - 1 for _ in range(N_CHUNKS)]
-    v = [torch.rand((N_HEADS, CHUNK_SIZE, D_HEAD), dtype=torch.float32, device='cuda') * 2 - 1 for _ in range(N_CHUNKS)]
+def pattern_large(n_seqs, n_heads, n_chunks, seed=42):
+    rng = np.random.RandomState(seed)
+    q = rng.randn(n_seqs, n_heads, D_HEAD).astype(np.float32) * 2.0
+    k = [rng.randn(n_heads, CHUNK_SIZE, D_HEAD).astype(np.float32) * 2.0 for _ in range(n_chunks)]
+    v = [rng.randn(n_heads, CHUNK_SIZE, D_HEAD).astype(np.float32) * 2.0 for _ in range(n_chunks)]
     return q, k, v
 
 
-@register_test('zeros_v')
-def test_zeros_v(seed=42):
-    """Zero V - output should be zero."""
-    torch.manual_seed(seed)
-    q = torch.randn((N_SEQS, N_HEADS, D_HEAD), dtype=torch.float32, device='cuda')
-    k = [torch.randn((N_HEADS, CHUNK_SIZE, D_HEAD), dtype=torch.float32, device='cuda') for _ in range(N_CHUNKS)]
-    v = [torch.zeros((N_HEADS, CHUNK_SIZE, D_HEAD), dtype=torch.float32, device='cuda') for _ in range(N_CHUNKS)]
+def pattern_positive(n_seqs, n_heads, n_chunks, seed=42):
+    rng = np.random.RandomState(seed)
+    q = np.abs(rng.randn(n_seqs, n_heads, D_HEAD).astype(np.float32))
+    k = [np.abs(rng.randn(n_heads, CHUNK_SIZE, D_HEAD).astype(np.float32)) for _ in range(n_chunks)]
+    v = [np.abs(rng.randn(n_heads, CHUNK_SIZE, D_HEAD).astype(np.float32)) for _ in range(n_chunks)]
     return q, k, v
 
 
-@register_test('identity_v')
-def test_identity_v(seed=42):
-    """Identity-like V matrix."""
-    torch.manual_seed(seed)
-    q = torch.randn((N_SEQS, N_HEADS, D_HEAD), dtype=torch.float32, device='cuda') * 0.1
-    k = [torch.randn((N_HEADS, CHUNK_SIZE, D_HEAD), dtype=torch.float32, device='cuda') * 0.1 for _ in range(N_CHUNKS)]
-    v = []
-    for _ in range(N_CHUNKS):
-        vt = torch.zeros((N_HEADS, CHUNK_SIZE, D_HEAD), dtype=torch.float32, device='cuda')
-        eye_size = min(CHUNK_SIZE, D_HEAD)
-        for h in range(N_HEADS):
-            vt[h, :eye_size, :eye_size] = torch.eye(eye_size, device='cuda')
-        v.append(vt)
-    return q, k, v
+DATA_PATTERNS = {
+    'randn': pattern_randn,
+    'small': pattern_small,
+    'ones': pattern_ones,
+    'uniform': pattern_uniform,
+    'large': pattern_large,
+    'positive': pattern_positive,
+}
 
 
-@register_test('positive')
-def test_positive(seed=42):
-    """All positive values."""
-    torch.manual_seed(seed)
-    q = torch.abs(torch.randn((N_SEQS, N_HEADS, D_HEAD), dtype=torch.float32, device='cuda'))
-    k = [torch.abs(torch.randn((N_HEADS, CHUNK_SIZE, D_HEAD), dtype=torch.float32, device='cuda')) for _ in range(N_CHUNKS)]
-    v = [torch.abs(torch.randn((N_HEADS, CHUNK_SIZE, D_HEAD), dtype=torch.float32, device='cuda')) for _ in range(N_CHUNKS)]
-    return q, k, v
+def generate_single_test(args):
+    """Generate a single test - designed for multiprocessing."""
+    pattern, n_seqs, n_heads, n_chunks = args
 
-
-@register_test('negative')
-def test_negative(seed=42):
-    """All negative values."""
-    torch.manual_seed(seed)
-    q = -torch.abs(torch.randn((N_SEQS, N_HEADS, D_HEAD), dtype=torch.float32, device='cuda'))
-    k = [-torch.abs(torch.randn((N_HEADS, CHUNK_SIZE, D_HEAD), dtype=torch.float32, device='cuda')) for _ in range(N_CHUNKS)]
-    v = [-torch.abs(torch.randn((N_HEADS, CHUNK_SIZE, D_HEAD), dtype=torch.float32, device='cuda')) for _ in range(N_CHUNKS)]
-    return q, k, v
-
-
-def generate_seed_tests():
-    """Generate tests with different random seeds."""
-    for seed in [123, 456, 789, 1000, 2000]:
-        name = f'seed{seed}'
-        TEST_CASES[name] = lambda s=seed: test_randn(s)
-
-
-generate_seed_tests()
-
-
-# =============================================================================
-# Main
-# =============================================================================
-
-def generate_test(name, verbose=False):
-    """Generate a single test case."""
-    if name not in TEST_CASES:
-        print(f"Unknown test: {name}")
+    if n_seqs > MAX_N_SEQS:
         return None
 
-    q, k, v = TEST_CASES[name]()
-    softmax_scale = 1.0 / math.sqrt(D_HEAD)
-    outputs, maxs, sums = compute_chunk_attention(q, k, v, softmax_scale)
+    try:
+        q, k, v = DATA_PATTERNS[pattern](n_seqs, n_heads, n_chunks, seed=42)
+        softmax_scale = 1.0 / math.sqrt(D_HEAD)
+        outputs, maxs, sums = compute_chunk_attention_cpu(q, k, v, softmax_scale)
 
-    filename = f'{name}_{N_SEQS}_{CHUNK_SIZE}_{D_HEAD}.txt'
-    write_test_file(filename, q, k, v, outputs, maxs, sums)
+        filename = f'{pattern}_s{n_seqs}_h{n_heads}_c{n_chunks}.txt'
+        filepath = TEST_DIR / filename
+        write_test_file(filepath, n_seqs, n_heads, n_chunks, q, k, v, outputs, maxs, sums)
+        return filename
+    except Exception as e:
+        print(f"ERROR {pattern} s{n_seqs} h{n_heads} c{n_chunks}: {e}")
+        return None
 
-    if verbose:
-        print(f"Generated: {filename}")
-        print(f"  Q range: [{q.min():.3f}, {q.max():.3f}]")
-        print(f"  Output range: [{outputs[0].min():.3f}, {outputs[0].max():.3f}]")
 
-    return filename
+def generate_grid(quick=False):
+    """Generate test grid using multiprocessing."""
+    if quick:
+        n_seqs_values = [8, 16, 32]
+        n_heads_values = [1, 4]
+        n_chunks_values = [1, 2, 4]
+        patterns = ['randn', 'small']
+    else:
+        n_seqs_values = [1, 2, 4, 8, 16, 24, 32]
+        n_heads_values = [1, 2, 4, 8, 12, 16]
+        n_chunks_values = [1, 2, 3, 4, 6, 8, 12, 16]
+        patterns = ['randn', 'small', 'uniform', 'large', 'positive']
+
+    # Create directories
+    TEST_DIR.mkdir(exist_ok=True)
+    OUTPUT_DIR.mkdir(exist_ok=True)
+
+    # Build list of all test configurations
+    configs = []
+    for pattern in patterns:
+        for n_seqs in n_seqs_values:
+            for n_heads in n_heads_values:
+                for n_chunks in n_chunks_values:
+                    configs.append((pattern, n_seqs, n_heads, n_chunks))
+
+    total = len(configs)
+    print(f"Generating {total} tests using {N_WORKERS} workers...")
+
+    start = time.time()
+
+    # Use multiprocessing pool
+    with Pool(N_WORKERS) as pool:
+        results = []
+        for i, result in enumerate(pool.imap_unordered(generate_single_test, configs, chunksize=32)):
+            if result:
+                results.append(result)
+            # Progress update every 100 tests
+            if (i + 1) % 100 == 0 or i + 1 == total:
+                print(f"\r  [{i+1}/{total}] generated...", end='', flush=True)
+
+    elapsed = time.time() - start
+    print(f"\nGenerated {len(results)} tests in {elapsed:.1f}s ({len(results)/elapsed:.0f} tests/sec)")
+    return results
+
+
+def create_runner(files):
+    """Create test runner script."""
+    with open('run_tests.sh', 'w') as f:
+        f.write('#!/bin/bash\n')
+        f.write('# Auto-generated test runner\n\n')
+        f.write('mkdir -p output\n\n')
+        f.write('PASSED=0\nFAILED=0\nFAILED_TESTS=""\n\n')
+        f.write(f'TOTAL={len(files)}\n')
+        f.write('COUNT=0\n\n')
+
+        for fn in sorted(files):
+            test_path = f'tests/{fn}'
+            out_path = f'output/{fn.replace(".txt", ".log")}'
+            f.write(f'((COUNT++))\n')
+            f.write(f'./attn_chunk_first {test_path} > {out_path} 2>&1\n')
+            f.write('if [ $? -eq 0 ]; then\n')
+            f.write('    ((PASSED++))\n')
+            f.write('else\n')
+            f.write(f'    echo "✗ {fn}"\n')
+            f.write('    ((FAILED++))\n')
+            f.write(f'    FAILED_TESTS="$FAILED_TESTS\\n  {fn}"\n')
+            f.write('fi\n')
+            f.write('if [ $((COUNT % 50)) -eq 0 ]; then\n')
+            f.write('    echo -ne "\\r[$COUNT/$TOTAL] $PASSED passed, $FAILED failed"\n')
+            f.write('fi\n\n')
+
+        f.write('echo -e "\\n\\n================================"\n')
+        f.write('echo "PASSED: $PASSED / $((PASSED + FAILED))"\n')
+        f.write('if [ $FAILED -gt 0 ]; then\n')
+        f.write('    echo -e "FAILED:$FAILED_TESTS"\n')
+        f.write('    exit 1\n')
+        f.write('else\n')
+        f.write('    echo "All tests passed!"\n')
+        f.write('fi\n')
+
+    os.chmod('run_tests.sh', 0o755)
+    print("Created run_tests.sh")
 
 
 def main():
@@ -205,54 +236,42 @@ def main():
         arg = sys.argv[1]
 
         if arg == '--list':
-            print("Available tests:")
-            for name in sorted(TEST_CASES.keys()):
-                print(f"  {name}")
+            print("Data patterns:", ', '.join(sorted(DATA_PATTERNS.keys())))
+            print(f"\nCompile-time: CHUNK_SIZE={CHUNK_SIZE}, D_HEAD={D_HEAD}, MAX_N_SEQS={MAX_N_SEQS}")
+            print("\nUsage:")
+            print("  python gentests.py                  # Full grid")
+            print("  python gentests.py --quick          # Quick test set")
+            print("  python gentests.py <pattern> <n_seqs> <n_heads> <n_chunks>")
             return
 
-        # Generate single test with verbose output
-        filename = generate_test(arg, verbose=True)
-        if filename:
-            print(f"\nRun with: ./attn_chunk_first {filename}")
-    else:
-        # Generate all tests quietly
-        print(f"Generating {len(TEST_CASES)} tests for dims ({N_SEQS}, {CHUNK_SIZE}, {D_HEAD})...")
+        if arg == '--quick':
+            files = generate_grid(quick=True)
+            create_runner(files)
+            print(f"\nRun: ./run_tests.sh")
+            return
 
-        files = []
-        for name in sorted(TEST_CASES.keys()):
-            try:
-                filename = generate_test(name, verbose=False)
-                if filename:
-                    files.append(filename)
-            except Exception as e:
-                print(f"  ERROR {name}: {e}")
+        # Single test generation
+        if arg in DATA_PATTERNS:
+            pattern = arg
+            n_seqs = int(sys.argv[2]) if len(sys.argv) > 2 else 16
+            n_heads = int(sys.argv[3]) if len(sys.argv) > 3 else 4
+            n_chunks = int(sys.argv[4]) if len(sys.argv) > 4 else 2
 
-        print(f"Generated {len(files)} test files")
+            TEST_DIR.mkdir(exist_ok=True)
+            result = generate_single_test((pattern, n_seqs, n_heads, n_chunks))
+            if result:
+                print(f"Generated: tests/{result}")
+                print(f"Run: ./attn_chunk_first tests/{result} -v")
+            return
 
-        # Create test runner
-        with open('run_tests.sh', 'w') as f:
-            f.write('#!/bin/bash\n')
-            f.write('# Run all tests and summarize results\n\n')
-            f.write('PASSED=0\nFAILED=0\nFAILED_TESTS=""\n\n')
-            for fn in files:
-                f.write(f'./attn_chunk_first {fn} > /tmp/test_out.txt 2>&1\n')
-                f.write('if [ $? -eq 0 ]; then\n')
-                f.write(f'    echo "✓ {fn}"\n')
-                f.write('    ((PASSED++))\n')
-                f.write('else\n')
-                f.write(f'    echo "✗ {fn}"\n')
-                f.write('    ((FAILED++))\n')
-                f.write(f'    FAILED_TESTS="$FAILED_TESTS {fn}"\n')
-                f.write('fi\n\n')
-            f.write('echo ""\necho "================================"\n')
-            f.write('echo "PASSED: $PASSED / $((PASSED + FAILED))"\n')
-            f.write('if [ $FAILED -gt 0 ]; then\n')
-            f.write('    echo "FAILED:$FAILED_TESTS"\n')
-            f.write('    exit 1\n')
-            f.write('fi\n')
+        print(f"Unknown argument: {arg}")
+        print("Use --list for help")
+        return
 
-        os.chmod('run_tests.sh', 0o755)
-        print("Run all tests with: ./run_tests.sh")
+    # Default: full grid
+    files = generate_grid(quick=False)
+    create_runner(files)
+    print(f"\nRun: ./run_tests.sh")
 
 
 if __name__ == '__main__':

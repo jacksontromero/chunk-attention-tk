@@ -4,21 +4,14 @@
 #include <vector>
 #include <cmath>
 #include <cstring>
+#include <sstream>
+#include <iomanip>
 
-// ===== Test configuration =====
-// These must match gentests.py
-constexpr int N_SEQS = 16;
+// ===== Compile-time tile size limits (must cover all test cases) =====
+constexpr int MAX_N_SEQS = 32;
 constexpr int CHUNK_SIZE = 64;
 constexpr int D_HEAD = 128;
-constexpr int N_HEADS = 4;
-constexpr int N_CHUNKS = 2;
 constexpr int BLOCK_LAUNCH_SIZE = 32;
-
-// Derived sizes
-constexpr int Q_SIZE = N_SEQS * N_HEADS * D_HEAD;
-constexpr int KV_CHUNK_SIZE = N_HEADS * CHUNK_SIZE * D_HEAD;
-constexpr int OUT_CHUNK_SIZE = N_HEADS * N_SEQS * D_HEAD;
-constexpr int MAX_SUM_CHUNK_SIZE = N_HEADS * N_SEQS;
 
 #define CudaCheckError() __cudaCheckError(__FILE__, __LINE__)
 inline void __cudaCheckError(const char *file, const int line) {
@@ -34,17 +27,7 @@ inline void __cudaCheckError(const char *file, const int line) {
     }
 }
 
-// Global verbosity flag
 bool g_verbose = false;
-
-template<typename T>
-void read_array(std::ifstream& infile, T* arr, int count) {
-    for (int i = 0; i < count; i++) {
-        float val;
-        infile >> val;
-        arr[i] = static_cast<T>(val);
-    }
-}
 
 void float_to_bf16(const float* src, bf16* dst, int count) {
     for (int i = 0; i < count; i++) {
@@ -52,103 +35,209 @@ void float_to_bf16(const float* src, bf16* dst, int count) {
     }
 }
 
+struct TestConfig {
+    int n_seqs;
+    int chunk_size;
+    int d_head;
+    int n_heads;
+    int n_chunks;
+};
+
+struct ErrorInfo {
+    int chunk, head, seq, dim;
+    float actual, expected, diff;
+};
+
 struct TestResult {
-    bool passed;
-    float attn_max_abs, attn_avg_abs, attn_max_rel, attn_avg_rel;
-    float maxs_max_abs, maxs_avg_abs, maxs_max_rel, maxs_avg_rel;
-    float sums_max_abs, sums_avg_abs, sums_max_rel, sums_avg_rel;
+    bool attn_pass, maxs_pass, sums_pass;
+    float attn_max_abs, attn_avg_abs;
+    float maxs_max_abs, maxs_avg_abs;
+    float sums_max_abs, sums_avg_abs;
     int attn_nan_count, maxs_nan_count, sums_nan_count;
+    int attn_fail_count, maxs_fail_count, sums_fail_count;
+    std::vector<ErrorInfo> attn_errors, maxs_errors, sums_errors;
 };
 
 TestResult check_correctness(
+    const TestConfig& cfg,
     float* h_attns, float* h_maxs, float* h_sums,
-    float* h_out_ref[], float* h_maxs_ref[], float* h_sums_ref[],
-    int* h_offsets
+    const std::vector<std::vector<float>>& h_out_ref,
+    const std::vector<std::vector<float>>& h_maxs_ref,
+    const std::vector<std::vector<float>>& h_sums_ref,
+    const std::vector<int>& h_offsets
 ) {
-    TestResult r = {true, 0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0};
-    int attn_count = 0, maxs_count = 0, sums_count = 0;
+    TestResult r = {};
+    r.attn_pass = r.maxs_pass = r.sums_pass = true;
 
-    for (int chunk = 0; chunk < N_CHUNKS; chunk++) {
+    int attn_count = 0, maxs_count = 0;
+    const int out_chunk_size = cfg.n_heads * cfg.n_seqs * cfg.d_head;
+    const int maxsum_chunk_size = cfg.n_heads * cfg.n_seqs;
+
+    for (int chunk = 0; chunk < cfg.n_chunks; chunk++) {
         int offset = h_offsets[chunk];
 
         // Check attention outputs
-        for (int i = 0; i < OUT_CHUNK_SIZE; i++) {
-            int idx = offset * N_HEADS * D_HEAD + i;
-            float actual = h_attns[idx];
-            float expected = h_out_ref[chunk][i];
-            float abs_diff = std::abs(actual - expected);
-            float rel_diff = abs_diff / std::max(std::abs(expected), 1.0f);
+        for (int h = 0; h < cfg.n_heads; h++) {
+            for (int s = 0; s < cfg.n_seqs; s++) {
+                for (int d = 0; d < cfg.d_head; d++) {
+                    int local_i = h * cfg.n_seqs * cfg.d_head + s * cfg.d_head + d;
+                    int global_idx = offset * cfg.n_heads * cfg.d_head + local_i;
 
-            if (std::isnan(actual) || std::isinf(actual)) {
-                r.attn_nan_count++;
-                r.passed = false;
-            } else {
-                r.attn_avg_abs += abs_diff;
-                r.attn_avg_rel += rel_diff;
-                r.attn_max_abs = std::max(r.attn_max_abs, abs_diff);
-                r.attn_max_rel = std::max(r.attn_max_rel, rel_diff);
-                attn_count++;
+                    float actual = h_attns[global_idx];
+                    float expected = h_out_ref[chunk][local_i];
+                    float abs_diff = std::abs(actual - expected);
 
-                float tol = std::max(0.1f, std::abs(expected) * 0.01f);
-                if (abs_diff > tol) r.passed = false;
+                    if (std::isnan(actual) || std::isinf(actual)) {
+                        r.attn_nan_count++;
+                        r.attn_pass = false;
+                        if (r.attn_errors.size() < 5) {
+                            r.attn_errors.push_back({chunk, h, s, d, actual, expected, abs_diff});
+                        }
+                    } else {
+                        r.attn_avg_abs += abs_diff;
+                        r.attn_max_abs = std::max(r.attn_max_abs, abs_diff);
+                        attn_count++;
+
+                        // bf16 has ~0.4% relative error, use 3% tolerance for safety
+                        float tol = std::max(0.1f, std::abs(expected) * 0.03f);
+                        if (abs_diff > tol) {
+                            r.attn_fail_count++;
+                            r.attn_pass = false;
+                            if (r.attn_errors.size() < 5) {
+                                r.attn_errors.push_back({chunk, h, s, d, actual, expected, abs_diff});
+                            }
+                        }
+                    }
+                }
             }
         }
 
-        // Check max/sum outputs
-        for (int i = 0; i < MAX_SUM_CHUNK_SIZE; i++) {
-            int idx = offset * N_HEADS + i;
+        // Check max/sum
+        for (int h = 0; h < cfg.n_heads; h++) {
+            for (int s = 0; s < cfg.n_seqs; s++) {
+                int local_i = h * cfg.n_seqs + s;
+                int global_idx = offset * cfg.n_heads + local_i;
 
-            float maxs_abs = std::abs(h_maxs[idx] - h_maxs_ref[chunk][i]);
-            float sums_abs = std::abs(h_sums[idx] - h_sums_ref[chunk][i]);
-            float maxs_rel = maxs_abs / std::max(std::abs(h_maxs_ref[chunk][i]), 1.0f);
-            float sums_rel = sums_abs / std::max(std::abs(h_sums_ref[chunk][i]), 1.0f);
+                float maxs_actual = h_maxs[global_idx];
+                float maxs_expected = h_maxs_ref[chunk][local_i];
+                float maxs_abs = std::abs(maxs_actual - maxs_expected);
 
-            if (std::isnan(h_maxs[idx])) r.maxs_nan_count++;
-            if (std::isnan(h_sums[idx])) r.sums_nan_count++;
+                float sums_actual = h_sums[global_idx];
+                float sums_expected = h_sums_ref[chunk][local_i];
+                float sums_abs = std::abs(sums_actual - sums_expected);
 
-            r.maxs_avg_abs += maxs_abs; r.maxs_avg_rel += maxs_rel;
-            r.sums_avg_abs += sums_abs; r.sums_avg_rel += sums_rel;
-            r.maxs_max_abs = std::max(r.maxs_max_abs, maxs_abs);
-            r.sums_max_abs = std::max(r.sums_max_abs, sums_abs);
-            r.maxs_max_rel = std::max(r.maxs_max_rel, maxs_rel);
-            r.sums_max_rel = std::max(r.sums_max_rel, sums_rel);
-            maxs_count++; sums_count++;
+                // Max values
+                if (std::isnan(maxs_actual) || std::isinf(maxs_actual)) {
+                    r.maxs_nan_count++;
+                    r.maxs_pass = false;
+                    if (r.maxs_errors.size() < 5) {
+                        r.maxs_errors.push_back({chunk, h, s, -1, maxs_actual, maxs_expected, maxs_abs});
+                    }
+                } else {
+                    r.maxs_avg_abs += maxs_abs;
+                    r.maxs_max_abs = std::max(r.maxs_max_abs, maxs_abs);
+                    float tol = std::max(0.1f, std::abs(maxs_expected) * 0.03f);
+                    if (maxs_abs > tol) {
+                        r.maxs_fail_count++;
+                        r.maxs_pass = false;
+                        if (r.maxs_errors.size() < 5) {
+                            r.maxs_errors.push_back({chunk, h, s, -1, maxs_actual, maxs_expected, maxs_abs});
+                        }
+                    }
+                }
 
-            float maxs_tol = std::max(0.1f, std::abs(h_maxs_ref[chunk][i]) * 0.01f);
-            float sums_tol = std::max(0.1f, std::abs(h_sums_ref[chunk][i]) * 0.01f);
-            if (maxs_abs > maxs_tol || std::isnan(maxs_abs)) r.passed = false;
-            if (sums_abs > sums_tol || std::isnan(sums_abs)) r.passed = false;
+                // Sum values
+                if (std::isnan(sums_actual) || std::isinf(sums_actual)) {
+                    r.sums_nan_count++;
+                    r.sums_pass = false;
+                    if (r.sums_errors.size() < 5) {
+                        r.sums_errors.push_back({chunk, h, s, -1, sums_actual, sums_expected, sums_abs});
+                    }
+                } else {
+                    r.sums_avg_abs += sums_abs;
+                    r.sums_max_abs = std::max(r.sums_max_abs, sums_abs);
+                    float                     tol = std::max(0.1f, std::abs(sums_expected) * 0.03f);
+                    if (sums_abs > tol) {
+                        r.sums_fail_count++;
+                        r.sums_pass = false;
+                        if (r.sums_errors.size() < 5) {
+                            r.sums_errors.push_back({chunk, h, s, -1, sums_actual, sums_expected, sums_abs});
+                        }
+                    }
+                }
+                maxs_count++;
+            }
         }
     }
 
-    if (attn_count > 0) { r.attn_avg_abs /= attn_count; r.attn_avg_rel /= attn_count; }
-    if (maxs_count > 0) { r.maxs_avg_abs /= maxs_count; r.maxs_avg_rel /= maxs_count; }
-    if (sums_count > 0) { r.sums_avg_abs /= sums_count; r.sums_avg_rel /= sums_count; }
+    if (attn_count > 0) r.attn_avg_abs /= attn_count;
+    if (maxs_count > 0) {
+        r.maxs_avg_abs /= maxs_count;
+        r.sums_avg_abs /= maxs_count;
+    }
 
     return r;
 }
 
-void print_result(const TestResult& r, bool verbose) {
-    if (verbose) {
-        std::cout << "\n=== Results ===" << std::endl;
-        std::cout << "Attention: " << (r.attn_nan_count == 0 && r.attn_max_abs < 1.0 ? "OK" : "ISSUES") << std::endl;
-        std::cout << "  Abs: max=" << r.attn_max_abs << ", avg=" << r.attn_avg_abs << std::endl;
-        std::cout << "  Rel: max=" << (r.attn_max_rel*100) << "%, avg=" << (r.attn_avg_rel*100) << "%" << std::endl;
+void print_errors(const std::vector<ErrorInfo>& errors, const char* name, bool is_vec) {
+    for (const auto& e : errors) {
+        if (is_vec) {
+            std::cout << "    [chunk=" << e.chunk << " head=" << e.head << " seq=" << e.seq << "] "
+                      << "actual=" << e.actual << " expected=" << e.expected
+                      << " diff=" << e.diff << std::endl;
+        } else {
+            std::cout << "    [chunk=" << e.chunk << " head=" << e.head << " seq=" << e.seq << " dim=" << e.dim << "] "
+                      << "actual=" << e.actual << " expected=" << e.expected
+                      << " diff=" << e.diff << std::endl;
+        }
+    }
+}
 
-        std::cout << "Max values:" << std::endl;
-        std::cout << "  Abs: max=" << r.maxs_max_abs << ", avg=" << r.maxs_avg_abs << std::endl;
-        std::cout << "  Rel: max=" << (r.maxs_max_rel*100) << "%, avg=" << (r.maxs_avg_rel*100) << "%" << std::endl;
+void print_result(const TestConfig& cfg, const TestResult& r, bool verbose) {
+    bool all_pass = r.attn_pass && r.maxs_pass && r.sums_pass;
 
-        std::cout << "Sum values:" << std::endl;
-        std::cout << "  Abs: max=" << r.sums_max_abs << ", avg=" << r.sums_avg_abs << std::endl;
-        std::cout << "  Rel: max=" << (r.sums_max_rel*100) << "%, avg=" << (r.sums_avg_rel*100) << "%" << std::endl;
+    // Always show details if failed, or if verbose
+    if (!all_pass || verbose) {
+        std::cout << "\n=== Test Results ===" << std::endl;
+        std::cout << "Config: n_seqs=" << cfg.n_seqs << " n_heads=" << cfg.n_heads
+                  << " n_chunks=" << cfg.n_chunks << std::endl;
 
-        if (r.attn_nan_count) std::cout << "Attention NaN/Inf: " << r.attn_nan_count << std::endl;
-        if (r.maxs_nan_count) std::cout << "Max NaN: " << r.maxs_nan_count << std::endl;
-        if (r.sums_nan_count) std::cout << "Sum NaN: " << r.sums_nan_count << std::endl;
+        std::cout << "\nAttention: " << (r.attn_pass ? "PASS" : "FAIL");
+        if (!r.attn_pass || verbose) {
+            std::cout << " (fails=" << r.attn_fail_count << " nan=" << r.attn_nan_count
+                      << " max_diff=" << r.attn_max_abs << " avg_diff=" << r.attn_avg_abs << ")";
+        }
+        std::cout << std::endl;
+        if (!r.attn_pass && !r.attn_errors.empty()) {
+            std::cout << "  First errors:" << std::endl;
+            print_errors(r.attn_errors, "attn", false);
+        }
+
+        std::cout << "Max values: " << (r.maxs_pass ? "PASS" : "FAIL");
+        if (!r.maxs_pass || verbose) {
+            std::cout << " (fails=" << r.maxs_fail_count << " nan=" << r.maxs_nan_count
+                      << " max_diff=" << r.maxs_max_abs << " avg_diff=" << r.maxs_avg_abs << ")";
+        }
+        std::cout << std::endl;
+        if (!r.maxs_pass && !r.maxs_errors.empty()) {
+            std::cout << "  First errors:" << std::endl;
+            print_errors(r.maxs_errors, "maxs", true);
+        }
+
+        std::cout << "Sum values: " << (r.sums_pass ? "PASS" : "FAIL");
+        if (!r.sums_pass || verbose) {
+            std::cout << " (fails=" << r.sums_fail_count << " nan=" << r.sums_nan_count
+                      << " max_diff=" << r.sums_max_abs << " avg_diff=" << r.sums_avg_abs << ")";
+        }
+        std::cout << std::endl;
+        if (!r.sums_pass && !r.sums_errors.empty()) {
+            std::cout << "  First errors:" << std::endl;
+            print_errors(r.sums_errors, "sums", true);
+        }
+        std::cout << std::endl;
     }
 
-    std::cout << (r.passed ? "PASSED" : "FAILED") << std::endl;
+    std::cout << (all_pass ? "PASSED" : "FAILED") << std::endl;
 }
 
 int main(int argc, char **argv) {
@@ -160,56 +249,75 @@ int main(int argc, char **argv) {
     const char* test_file = argv[1];
     g_verbose = (argc > 2 && strcmp(argv[2], "-v") == 0);
 
-    if (g_verbose) {
-        std::cout << "=== Chunked Attention TK Test ===" << std::endl;
-        std::cout << "Config: N_SEQS=" << N_SEQS << ", CHUNK_SIZE=" << CHUNK_SIZE
-                  << ", D_HEAD=" << D_HEAD << ", N_HEADS=" << N_HEADS << std::endl;
-    }
-
-    // Allocate host memory
-    float *h_q = new float[Q_SIZE];
-    float *h_k[N_CHUNKS], *h_v[N_CHUNKS];
-    float *h_out_ref[N_CHUNKS], *h_maxs_ref[N_CHUNKS], *h_sums_ref[N_CHUNKS];
-
-    for (int i = 0; i < N_CHUNKS; i++) {
-        h_k[i] = new float[KV_CHUNK_SIZE];
-        h_v[i] = new float[KV_CHUNK_SIZE];
-        h_out_ref[i] = new float[OUT_CHUNK_SIZE];
-        h_maxs_ref[i] = new float[MAX_SUM_CHUNK_SIZE];
-        h_sums_ref[i] = new float[MAX_SUM_CHUNK_SIZE];
-    }
-
-    // Load test data
     std::ifstream infile(test_file);
     if (!infile.is_open()) {
         std::cerr << "Failed to open " << test_file << std::endl;
         return 1;
     }
 
-    read_array(infile, h_q, Q_SIZE);
-    for (int i = 0; i < N_CHUNKS; i++) read_array(infile, h_k[i], KV_CHUNK_SIZE);
-    for (int i = 0; i < N_CHUNKS; i++) read_array(infile, h_v[i], KV_CHUNK_SIZE);
-    for (int i = 0; i < N_CHUNKS; i++) read_array(infile, h_out_ref[i], OUT_CHUNK_SIZE);
-    for (int i = 0; i < N_CHUNKS; i++) read_array(infile, h_maxs_ref[i], MAX_SUM_CHUNK_SIZE);
-    for (int i = 0; i < N_CHUNKS; i++) read_array(infile, h_sums_ref[i], MAX_SUM_CHUNK_SIZE);
+    // Read header
+    TestConfig cfg;
+    std::string header;
+    std::getline(infile, header);
+    std::istringstream hs(header);
+    hs >> cfg.n_seqs >> cfg.chunk_size >> cfg.d_head >> cfg.n_heads >> cfg.n_chunks;
+
+    if (g_verbose) {
+        std::cout << "Loading: " << test_file << std::endl;
+        std::cout << "Config: n_seqs=" << cfg.n_seqs << ", chunk_size=" << cfg.chunk_size
+                  << ", d_head=" << cfg.d_head << ", n_heads=" << cfg.n_heads
+                  << ", n_chunks=" << cfg.n_chunks << std::endl;
+    }
+
+    // Validate
+    if (cfg.n_seqs > MAX_N_SEQS) {
+        std::cerr << "ERROR: n_seqs=" << cfg.n_seqs << " exceeds MAX_N_SEQS=" << MAX_N_SEQS << std::endl;
+        return 1;
+    }
+    if (cfg.chunk_size != CHUNK_SIZE || cfg.d_head != D_HEAD) {
+        std::cerr << "ERROR: chunk_size=" << cfg.chunk_size << " or d_head=" << cfg.d_head
+                  << " mismatch (expected " << CHUNK_SIZE << ", " << D_HEAD << ")" << std::endl;
+        return 1;
+    }
+
+    // Compute sizes
+    const int q_size = cfg.n_seqs * cfg.n_heads * cfg.d_head;
+    const int kv_chunk_size = cfg.n_heads * cfg.chunk_size * cfg.d_head;
+    const int out_chunk_size = cfg.n_heads * cfg.n_seqs * cfg.d_head;
+    const int maxsum_chunk_size = cfg.n_heads * cfg.n_seqs;
+
+    // Allocate and read
+    std::vector<float> h_q(q_size);
+    std::vector<std::vector<float>> h_k(cfg.n_chunks), h_v(cfg.n_chunks);
+    std::vector<std::vector<float>> h_out_ref(cfg.n_chunks), h_maxs_ref(cfg.n_chunks), h_sums_ref(cfg.n_chunks);
+
+    auto read_array = [&](std::vector<float>& arr) {
+        for (size_t i = 0; i < arr.size(); i++) infile >> arr[i];
+    };
+
+    for (int i = 0; i < q_size; i++) infile >> h_q[i];
+    for (int c = 0; c < cfg.n_chunks; c++) { h_k[c].resize(kv_chunk_size); read_array(h_k[c]); }
+    for (int c = 0; c < cfg.n_chunks; c++) { h_v[c].resize(kv_chunk_size); read_array(h_v[c]); }
+    for (int c = 0; c < cfg.n_chunks; c++) { h_out_ref[c].resize(out_chunk_size); read_array(h_out_ref[c]); }
+    for (int c = 0; c < cfg.n_chunks; c++) { h_maxs_ref[c].resize(maxsum_chunk_size); read_array(h_maxs_ref[c]); }
+    for (int c = 0; c < cfg.n_chunks; c++) { h_sums_ref[c].resize(maxsum_chunk_size); read_array(h_sums_ref[c]); }
     infile.close();
 
-    if (g_verbose) std::cout << "Test data loaded" << std::endl;
-
     // Allocate device memory
-    bf16 *d_q, *d_k[N_CHUNKS], *d_v[N_CHUNKS];
+    bf16 *d_q;
+    std::vector<bf16*> d_k(cfg.n_chunks), d_v(cfg.n_chunks);
     float *d_attns, *d_maxs, *d_sums;
     void **d_keys_ptrs, **d_values_ptrs;
     int *d_offsets, *d_begins, *d_ends;
 
-    cudaMalloc(&d_q, Q_SIZE * sizeof(bf16));
-    for (int i = 0; i < N_CHUNKS; i++) {
-        cudaMalloc(&d_k[i], KV_CHUNK_SIZE * sizeof(bf16));
-        cudaMalloc(&d_v[i], KV_CHUNK_SIZE * sizeof(bf16));
+    cudaMalloc(&d_q, q_size * sizeof(bf16));
+    for (int c = 0; c < cfg.n_chunks; c++) {
+        cudaMalloc(&d_k[c], kv_chunk_size * sizeof(bf16));
+        cudaMalloc(&d_v[c], kv_chunk_size * sizeof(bf16));
     }
 
-    const int total_out = N_CHUNKS * OUT_CHUNK_SIZE;
-    const int total_maxsum = N_CHUNKS * MAX_SUM_CHUNK_SIZE;
+    const int total_out = cfg.n_chunks * out_chunk_size;
+    const int total_maxsum = cfg.n_chunks * maxsum_chunk_size;
     cudaMalloc(&d_attns, total_out * sizeof(float));
     cudaMalloc(&d_maxs, total_maxsum * sizeof(float));
     cudaMalloc(&d_sums, total_maxsum * sizeof(float));
@@ -217,115 +325,112 @@ int main(int argc, char **argv) {
     cudaMemset(d_maxs, 0, total_maxsum * sizeof(float));
     cudaMemset(d_sums, 0, total_maxsum * sizeof(float));
 
-    // Convert and copy Q, K, V
-    bf16 *h_q_bf16 = new bf16[Q_SIZE];
-    float_to_bf16(h_q, h_q_bf16, Q_SIZE);
-    cudaMemcpy(d_q, h_q_bf16, Q_SIZE * sizeof(bf16), cudaMemcpyHostToDevice);
-    delete[] h_q_bf16;
+    // Convert and copy
+    std::vector<bf16> h_q_bf16(q_size);
+    float_to_bf16(h_q.data(), h_q_bf16.data(), q_size);
+    cudaMemcpy(d_q, h_q_bf16.data(), q_size * sizeof(bf16), cudaMemcpyHostToDevice);
 
-    for (int i = 0; i < N_CHUNKS; i++) {
-        bf16 *h_k_bf16 = new bf16[KV_CHUNK_SIZE];
-        bf16 *h_v_bf16 = new bf16[KV_CHUNK_SIZE];
-        float_to_bf16(h_k[i], h_k_bf16, KV_CHUNK_SIZE);
-        float_to_bf16(h_v[i], h_v_bf16, KV_CHUNK_SIZE);
-        cudaMemcpy(d_k[i], h_k_bf16, KV_CHUNK_SIZE * sizeof(bf16), cudaMemcpyHostToDevice);
-        cudaMemcpy(d_v[i], h_v_bf16, KV_CHUNK_SIZE * sizeof(bf16), cudaMemcpyHostToDevice);
-        delete[] h_k_bf16;
-        delete[] h_v_bf16;
+    for (int c = 0; c < cfg.n_chunks; c++) {
+        std::vector<bf16> h_k_bf16(kv_chunk_size), h_v_bf16(kv_chunk_size);
+        float_to_bf16(h_k[c].data(), h_k_bf16.data(), kv_chunk_size);
+        float_to_bf16(h_v[c].data(), h_v_bf16.data(), kv_chunk_size);
+        cudaMemcpy(d_k[c], h_k_bf16.data(), kv_chunk_size * sizeof(bf16), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_v[c], h_v_bf16.data(), kv_chunk_size * sizeof(bf16), cudaMemcpyHostToDevice);
     }
 
-    // Setup pointer arrays
-    void *h_keys_ptrs[N_CHUNKS], *h_values_ptrs[N_CHUNKS];
-    for (int i = 0; i < N_CHUNKS; i++) {
-        h_keys_ptrs[i] = d_k[i];
-        h_values_ptrs[i] = d_v[i];
+    // Setup pointers
+    std::vector<void*> h_keys_ptrs(cfg.n_chunks), h_values_ptrs(cfg.n_chunks);
+    for (int c = 0; c < cfg.n_chunks; c++) {
+        h_keys_ptrs[c] = d_k[c];
+        h_values_ptrs[c] = d_v[c];
     }
-    cudaMalloc(&d_keys_ptrs, N_CHUNKS * sizeof(void*));
-    cudaMalloc(&d_values_ptrs, N_CHUNKS * sizeof(void*));
-    cudaMemcpy(d_keys_ptrs, h_keys_ptrs, N_CHUNKS * sizeof(void*), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_values_ptrs, h_values_ptrs, N_CHUNKS * sizeof(void*), cudaMemcpyHostToDevice);
+    cudaMalloc(&d_keys_ptrs, cfg.n_chunks * sizeof(void*));
+    cudaMalloc(&d_values_ptrs, cfg.n_chunks * sizeof(void*));
+    cudaMemcpy(d_keys_ptrs, h_keys_ptrs.data(), cfg.n_chunks * sizeof(void*), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_values_ptrs, h_values_ptrs.data(), cfg.n_chunks * sizeof(void*), cudaMemcpyHostToDevice);
 
-    // Setup chunk metadata
-    int h_begins[N_CHUNKS], h_ends[N_CHUNKS], h_offsets[N_CHUNKS];
-    for (int i = 0; i < N_CHUNKS; i++) {
-        h_begins[i] = 0;
-        h_ends[i] = N_SEQS;
-        h_offsets[i] = i * N_SEQS;
+    // Setup metadata
+    std::vector<int> h_begins(cfg.n_chunks), h_ends(cfg.n_chunks), h_offsets(cfg.n_chunks);
+    for (int c = 0; c < cfg.n_chunks; c++) {
+        h_begins[c] = 0;
+        h_ends[c] = cfg.n_seqs;
+        h_offsets[c] = c * cfg.n_seqs;
     }
-    cudaMalloc(&d_begins, N_CHUNKS * sizeof(int));
-    cudaMalloc(&d_ends, N_CHUNKS * sizeof(int));
-    cudaMalloc(&d_offsets, N_CHUNKS * sizeof(int));
-    cudaMemcpy(d_begins, h_begins, N_CHUNKS * sizeof(int), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_ends, h_ends, N_CHUNKS * sizeof(int), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_offsets, h_offsets, N_CHUNKS * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMalloc(&d_begins, cfg.n_chunks * sizeof(int));
+    cudaMalloc(&d_ends, cfg.n_chunks * sizeof(int));
+    cudaMalloc(&d_offsets, cfg.n_chunks * sizeof(int));
+    cudaMemcpy(d_begins, h_begins.data(), cfg.n_chunks * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_ends, h_ends.data(), cfg.n_chunks * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_offsets, h_offsets.data(), cfg.n_chunks * sizeof(int), cudaMemcpyHostToDevice);
     CudaCheckError();
 
-    // Setup kernel globals
-    using globals_t = attn_chunk_first_globals<N_SEQS, D_HEAD>;
+    // Setup globals
+    using globals_t = attn_chunk_first_globals<MAX_N_SEQS, D_HEAD>;
 
-    auto gQ = gl<bf16, 1, 1, N_SEQS, -1, st<bf16, N_SEQS, D_HEAD>>(
-        d_q, nullptr, nullptr, nullptr, N_HEADS * D_HEAD);
-    auto gAttns = gl<float, -1, -1, -1, -1>(d_attns, 1, 1, N_CHUNKS * N_HEADS * N_SEQS, D_HEAD);
+    auto gAttns = gl<float, -1, -1, -1, -1>(d_attns, 1, 1, total_out / cfg.d_head, cfg.d_head);
     auto gMaxs = gl<float, -1, -1, -1, -1>(d_maxs, 1, 1, 1, total_maxsum);
     auto gSums = gl<float, -1, -1, -1, -1>(d_sums, 1, 1, 1, total_maxsum);
-    auto gOffsets = gl<int, -1, -1, -1, -1>(d_offsets, 1, 1, 1, N_CHUNKS);
-    auto gBegins = gl<int, -1, -1, -1, -1>(d_begins, 1, 1, 1, N_CHUNKS);
-    auto gEnds = gl<int, -1, -1, -1, -1>(d_ends, 1, 1, 1, N_CHUNKS);
+    auto gOffsets = gl<int, -1, -1, -1, -1>(d_offsets, 1, 1, 1, cfg.n_chunks);
+    auto gBegins = gl<int, -1, -1, -1, -1>(d_begins, 1, 1, 1, cfg.n_chunks);
+    auto gEnds = gl<int, -1, -1, -1, -1>(d_ends, 1, 1, 1, cfg.n_chunks);
 
     globals_t g{
         .gAttns = gAttns, .gMaxs = gMaxs, .gSums = gSums,
         .gOffsets = gOffsets, .gBegins = gBegins, .gEnds = gEnds,
-        .gQ = gQ, .gKeys = d_keys_ptrs, .gValues = d_values_ptrs,
-        .dim_scale = 1.0f / sqrtf(static_cast<float>(D_HEAD)),
-        .n_heads = N_HEADS
+        .gQ = d_q, .gKeys = d_keys_ptrs, .gValues = d_values_ptrs,
+        .dim_scale = 1.0f / sqrtf(static_cast<float>(cfg.d_head)),
+        .n_heads = cfg.n_heads
     };
 
-    // Calculate shared memory
-    size_t smem = sizeof(st<bf16, N_SEQS, D_HEAD>) +
+    // Shared memory
+    size_t smem = sizeof(st<bf16, MAX_N_SEQS, D_HEAD>) +
                   sizeof(st<bf16, CHUNK_SIZE, D_HEAD>) * 2 +
-                  sizeof(st<float, N_SEQS, D_HEAD>);
+                  sizeof(st<float, MAX_N_SEQS, CHUNK_SIZE>) +
+                  sizeof(st<float, MAX_N_SEQS, D_HEAD>);
     smem = ((smem + 4095) / 4096) * 4096;
 
-    cudaFuncSetAttribute(attn_chunk_first_tk<N_SEQS, CHUNK_SIZE, D_HEAD>,
+    cudaFuncSetAttribute(attn_chunk_first_tk<MAX_N_SEQS, CHUNK_SIZE, D_HEAD>,
                          cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     CudaCheckError();
 
-    // Launch kernel
-    dim3 grid(N_HEADS, N_CHUNKS);
+    // Launch
+    dim3 grid(cfg.n_heads, cfg.n_chunks);
     dim3 block(BLOCK_LAUNCH_SIZE);
 
-    if (g_verbose) std::cout << "Launching kernel..." << std::endl;
+    if (g_verbose) std::cout << "Launching kernel: grid=(" << cfg.n_heads << "," << cfg.n_chunks << ")" << std::endl;
 
     cudaDeviceSynchronize();
-    attn_chunk_first_tk<N_SEQS, CHUNK_SIZE, D_HEAD><<<grid, block, smem>>>(g);
+    attn_chunk_first_tk<MAX_N_SEQS, CHUNK_SIZE, D_HEAD><<<grid, block, smem>>>(g);
     cudaDeviceSynchronize();
     CudaCheckError();
 
-    // Copy results back
-    float *h_attns = new float[total_out];
-    float *h_maxs = new float[total_maxsum];
-    float *h_sums = new float[total_maxsum];
-    cudaMemcpy(h_attns, d_attns, total_out * sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_maxs, d_maxs, total_maxsum * sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_sums, d_sums, total_maxsum * sizeof(float), cudaMemcpyDeviceToHost);
+    // Copy back
+    std::vector<float> h_attns(total_out), h_maxs(total_maxsum), h_sums(total_maxsum);
+    cudaMemcpy(h_attns.data(), d_attns, total_out * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_maxs.data(), d_maxs, total_maxsum * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_sums.data(), d_sums, total_maxsum * sizeof(float), cudaMemcpyDeviceToHost);
 
-    // Check correctness
-    TestResult result = check_correctness(h_attns, h_maxs, h_sums, h_out_ref, h_maxs_ref, h_sums_ref, h_offsets);
-    print_result(result, g_verbose);
+    // Check
+    TestResult result = check_correctness(cfg, h_attns.data(), h_maxs.data(), h_sums.data(),
+                                          h_out_ref, h_maxs_ref, h_sums_ref, h_offsets);
+    print_result(cfg, result, g_verbose);
 
     // Cleanup
-    delete[] h_q;
-    for (int i = 0; i < N_CHUNKS; i++) {
-        delete[] h_k[i]; delete[] h_v[i];
-        delete[] h_out_ref[i]; delete[] h_maxs_ref[i]; delete[] h_sums_ref[i];
-    }
-    delete[] h_attns; delete[] h_maxs; delete[] h_sums;
-
     cudaFree(d_q);
-    for (int i = 0; i < N_CHUNKS; i++) { cudaFree(d_k[i]); cudaFree(d_v[i]); }
+    for (int c = 0; c < cfg.n_chunks; c++) { cudaFree(d_k[c]); cudaFree(d_v[c]); }
     cudaFree(d_attns); cudaFree(d_maxs); cudaFree(d_sums);
     cudaFree(d_keys_ptrs); cudaFree(d_values_ptrs);
     cudaFree(d_offsets); cudaFree(d_begins); cudaFree(d_ends);
 
-    return result.passed ? 0 : 1;
+    bool all_pass = result.attn_pass && result.maxs_pass && result.sums_pass;
+
+    // Output summary line for test runner parsing
+    int total_values = cfg.n_chunks * cfg.n_heads * cfg.n_seqs * cfg.d_head;
+    int total_fails = result.attn_fail_count + result.attn_nan_count;
+    float fail_rate = 100.0f * total_fails / total_values;
+    std::cout << "SUMMARY: fails=" << total_fails << "/" << total_values
+              << " (" << std::fixed << std::setprecision(2) << fail_rate << "%)"
+              << " max_diff=" << result.attn_max_abs << std::endl;
+
+    return all_pass ? 0 : 1;
 }

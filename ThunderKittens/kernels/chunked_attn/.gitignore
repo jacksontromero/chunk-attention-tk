@@ -1,0 +1,8 @@
+# Generated test files
+tests/
+run_tests.sh
+
+# Build artifacts
+attn_chunk_first
+*.d
+
