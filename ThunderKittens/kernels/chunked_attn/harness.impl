@@ -45,6 +45,30 @@ struct TestConfig {
     int n_seqs, chunk_size, d_head, n_heads, n_chunks;
 };
 
+struct Stats {
+    int fails = 0, nans = 0, total = 0;
+    float max_abs = 0, sum_abs = 0;
+    float max_rel = 0, sum_rel = 0;
+
+    void add(float actual, float expected, float tol) {
+        float abs_diff = std::abs(actual - expected);
+        float rel_diff = (expected != 0) ? 100.0f * abs_diff / std::abs(expected) : 0;
+
+        total++;
+        max_abs = std::max(max_abs, abs_diff);
+        sum_abs += abs_diff;
+        max_rel = std::max(max_rel, rel_diff);
+        sum_rel += rel_diff;
+
+        if (std::isnan(actual) || std::isinf(actual)) nans++;
+        else if (abs_diff > tol) fails++;
+    }
+
+    float avg_abs() const { return total > 0 ? sum_abs / total : 0; }
+    float avg_rel() const { return total > 0 ? sum_rel / total : 0; }
+    bool pass() const { return fails == 0 && nans == 0; }
+};
+
 bool verify(const TestConfig& cfg,
             const float* actual_attns, const float* actual_maxs, const float* actual_sums,
             const std::vector<std::vector<float>>& ref_attns,
@@ -53,8 +77,8 @@ bool verify(const TestConfig& cfg,
             const std::vector<int>& offsets,
             bool verbose) {
 
-    int fails = 0, total = 0;
-    float max_diff = 0.0f;
+    Stats attn, maxs, sums;
+    int first_errors = 0;
 
     for (int c = 0; c < cfg.n_chunks; c++) {
         int off = offsets[c];
@@ -68,18 +92,15 @@ bool verify(const TestConfig& cfg,
 
                     float act = actual_attns[global];
                     float exp = ref_attns[c][local];
-                    float diff = std::abs(act - exp);
                     float tol = std::max(0.1f, std::abs(exp) * 0.03f);
 
-                    max_diff = std::max(max_diff, diff);
-                    total++;
+                    int prev_fails = attn.fails + attn.nans;
+                    attn.add(act, exp, tol);
 
-                    if (std::isnan(act) || std::isinf(act) || diff > tol) {
-                        fails++;
-                        if (verbose && fails <= 5) {
-                            std::cout << "  FAIL attn[c=" << c << " h=" << h << " s=" << s << " d=" << d
-                                      << "] act=" << act << " exp=" << exp << " diff=" << diff << "\n";
-                        }
+                    if (verbose && (attn.fails + attn.nans) > prev_fails && first_errors < 5) {
+                        std::cout << "  FAIL attn[c=" << c << " h=" << h << " s=" << s << " d=" << d
+                                  << "] act=" << act << " exp=" << exp << " diff=" << std::abs(act-exp) << "\n";
+                        first_errors++;
                     }
                 }
             }
@@ -93,24 +114,41 @@ bool verify(const TestConfig& cfg,
 
                 float max_act = actual_maxs[global], max_exp = ref_maxs[c][local];
                 float sum_act = actual_sums[global], sum_exp = ref_sums[c][local];
-                float tol_m = std::max(0.1f, std::abs(max_exp) * 0.03f);
-                float tol_s = std::max(0.1f, std::abs(sum_exp) * 0.03f);
 
-                if (std::abs(max_act - max_exp) > tol_m && verbose && fails <= 5)
-                    std::cout << "  FAIL max[c=" << c << " h=" << h << " s=" << s << "] act=" << max_act << " exp=" << max_exp << "\n";
-                if (std::abs(sum_act - sum_exp) > tol_s && verbose && fails <= 5)
-                    std::cout << "  FAIL sum[c=" << c << " h=" << h << " s=" << s << "] act=" << sum_act << " exp=" << sum_exp << "\n";
+                maxs.add(max_act, max_exp, std::max(0.1f, std::abs(max_exp) * 0.03f));
+                sums.add(sum_act, sum_exp, std::max(0.1f, std::abs(sum_exp) * 0.03f));
             }
         }
     }
 
-    float fail_rate = 100.0f * fails / total;
-    std::cout << (fails == 0 ? "PASSED" : "FAILED") << "\n";
-    std::cout << "SUMMARY: fails=" << fails << "/" << total
-              << " (" << std::fixed << std::setprecision(2) << fail_rate << "%)"
-              << " max_diff=" << max_diff << "\n";
+    bool all_pass = attn.pass() && maxs.pass() && sums.pass();
 
-    return fails == 0;
+    // Print results
+    if (verbose || !all_pass) {
+        std::cout << "\n=== Results ===\n";
+        std::cout << "Attention: " << (attn.pass() ? "PASS" : "FAIL")
+                  << " (fails=" << attn.fails << "/" << attn.total << " nan=" << attn.nans << ")\n"
+                  << "  Abs: max=" << attn.max_abs << " avg=" << attn.avg_abs() << "\n"
+                  << "  Rel: max=" << std::fixed << std::setprecision(2) << attn.max_rel
+                  << "% avg=" << attn.avg_rel() << "%\n";
+        std::cout << "Max values: " << (maxs.pass() ? "PASS" : "FAIL")
+                  << " (fails=" << maxs.fails << "/" << maxs.total << " nan=" << maxs.nans << ")\n"
+                  << "  Abs: max=" << maxs.max_abs << " avg=" << maxs.avg_abs() << "\n";
+        std::cout << "Sum values: " << (sums.pass() ? "PASS" : "FAIL")
+                  << " (fails=" << sums.fails << "/" << sums.total << " nan=" << sums.nans << ")\n"
+                  << "  Abs: max=" << sums.max_abs << " avg=" << sums.avg_abs() << "\n";
+    }
+
+    std::cout << (all_pass ? "PASSED" : "FAILED") << "\n";
+
+    // Summary line for test runner
+    int total_fails = attn.fails + attn.nans;
+    float fail_rate = 100.0f * total_fails / attn.total;
+    std::cout << "SUMMARY: fails=" << total_fails << "/" << attn.total
+              << " (" << std::fixed << std::setprecision(2) << fail_rate << "%)"
+              << " max_diff=" << attn.max_abs << "\n";
+
+    return all_pass;
 }
 
 // ============================================================================

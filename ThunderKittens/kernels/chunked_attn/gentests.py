@@ -193,39 +193,70 @@ def generate_grid(quick=False):
 
 
 def create_runner(files):
-    """Create test runner script."""
+    """Create test runner script with parallel execution support."""
     with open('run_tests.sh', 'w') as f:
-        f.write('#!/bin/bash\n')
-        f.write('# Auto-generated test runner\n\n')
-        f.write('mkdir -p output\n\n')
-        f.write('PASSED=0\nFAILED=0\nFAILED_TESTS=""\n\n')
-        f.write(f'TOTAL={len(files)}\n')
-        f.write('COUNT=0\n\n')
+        f.write(f'''#!/bin/bash
+# Auto-generated test runner
+# Usage: ./run_tests.sh [JOBS]   (default: 4 parallel jobs)
 
+JOBS=${{1:-4}}
+TOTAL={len(files)}
+RESULTS_FILE=$(mktemp)
+
+echo "Running $TOTAL tests with $JOBS parallel jobs..."
+echo ""
+
+# Function to run a single test and output result (streams to terminal)
+run_test() {{
+    TEST="$1"
+    RESULTS_FILE="$2"
+    NAME=$(basename "$TEST")
+    OUTPUT=$(./attn_chunk_first "$TEST" 2>&1)
+    if [ $? -eq 0 ]; then
+        echo "✓ $NAME"
+        echo "PASS" >> "$RESULTS_FILE"
+    else
+        SUMMARY=$(echo "$OUTPUT" | grep "SUMMARY:" | head -1)
+        echo "✗ $NAME - $SUMMARY"
+        echo "FAIL:$NAME" >> "$RESULTS_FILE"
+    fi
+}}
+export -f run_test
+
+# Run tests in parallel, streaming output
+cat << 'TESTLIST' | xargs -P "$JOBS" -I {{}} bash -c 'run_test "{{}}" "'$RESULTS_FILE'"'
+''')
         for fn in sorted(files):
-            test_path = f'tests/{fn}'
-            out_path = f'output/{fn.replace(".txt", ".log")}'
-            f.write(f'((COUNT++))\n')
-            f.write(f'./attn_chunk_first {test_path} > {out_path} 2>&1\n')
-            f.write('if [ $? -eq 0 ]; then\n')
-            f.write('    ((PASSED++))\n')
-            f.write('else\n')
-            f.write(f'    echo "✗ {fn}"\n')
-            f.write('    ((FAILED++))\n')
-            f.write(f'    FAILED_TESTS="$FAILED_TESTS\\n  {fn}"\n')
-            f.write('fi\n')
-            f.write('if [ $((COUNT % 50)) -eq 0 ]; then\n')
-            f.write('    echo -ne "\\r[$COUNT/$TOTAL] $PASSED passed, $FAILED failed"\n')
-            f.write('fi\n\n')
+            f.write(f'tests/{fn}\n')
+        f.write('''TESTLIST
 
-        f.write('echo -e "\\n\\n================================"\n')
-        f.write('echo "PASSED: $PASSED / $((PASSED + FAILED))"\n')
-        f.write('if [ $FAILED -gt 0 ]; then\n')
-        f.write('    echo -e "FAILED:$FAILED_TESTS"\n')
-        f.write('    exit 1\n')
-        f.write('else\n')
-        f.write('    echo "All tests passed!"\n')
-        f.write('fi\n')
+# Count results
+PASSED=$(grep -c "^PASS$" "$RESULTS_FILE" || true)
+PASSED=${PASSED:-0}
+FAILED=0
+FAILED_TESTS=""
+
+while IFS= read -r line; do
+    if [[ "$line" == FAIL:* ]]; then
+        ((FAILED++))
+        NAME="${line#FAIL:}"
+        FAILED_TESTS="$FAILED_TESTS\\n  $NAME"
+    fi
+done < <(grep "^FAIL:" "$RESULTS_FILE" 2>/dev/null || true)
+
+rm -f "$RESULTS_FILE"
+
+TOTAL_RUN=$((PASSED + FAILED))
+echo ""
+echo "================================"
+echo "PASSED: $PASSED / $TOTAL_RUN"
+if [ "$FAILED" -gt 0 ]; then
+    echo -e "FAILED:$FAILED_TESTS"
+    exit 1
+else
+    echo "All tests passed!"
+fi
+''')
 
     os.chmod('run_tests.sh', 0o755)
     print("Created run_tests.sh")

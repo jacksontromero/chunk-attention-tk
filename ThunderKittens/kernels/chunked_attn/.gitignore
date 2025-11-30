@@ -1,5 +1,6 @@
 # Generated test files
 tests/
+output/
 run_tests.sh
 
 # Build artifacts

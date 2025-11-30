@@ -1,85 +1,54 @@
-# Chunked Attention ThunderKittens Kernel
+# Chunked Attention (ThunderKittens)
 
-This directory contains a ThunderKittens implementation of the chunked attention kernel for testing and benchmarking.
+ThunderKittens implementation of `attn_chunk_first_kernel_v2` from `chunk_attn/cpp/chunk_attn/kernel_cuda.cu`.
+
+## What it computes
+
+For shared-prefix chunked attention:
+```
+scores = Q @ K^T * scale       # [n_seqs, chunk_size]
+maxs = row_max(scores)         # [n_seqs] - for numerical stability
+exp_scores = exp(scores - maxs)
+sums = row_sum(exp_scores)     # [n_seqs] - for later normalization
+attns = exp_scores @ V         # [n_seqs, d_head] - unnormalized partial result
+```
+
+## Build & Test
+
+```bash
+make clean && make
+python gentests.py --quick     # Generate test files
+./run_tests.sh                 # Run all tests
+./attn_chunk_first tests/randn_s16_h4_c2.txt -v  # Single test with verbose output
+```
+
+## Configuration
+
+| Parameter | Value | Notes |
+|-----------|-------|-------|
+| MAX_N_SEQS | 32 | Max query rows (compile-time) |
+| CHUNK_SIZE | 64 | K/V chunk size (compile-time) |
+| D_HEAD | 128 | Head dimension (compile-time) |
+| NUM_WARPS | 2 | Row-parallel warps per block |
+
+## Architecture
+
+- **Grid**: `(n_heads, n_chunks)` - one block per (head, chunk) pair
+- **Block**: 64 threads (2 warps), each warp handles 16 query rows
+- **Row-parallel**: K/V loaded cooperatively, then each warp processes its rows independently
+
+## Differences from original
+
+| Aspect | Original | TK Version |
+|--------|----------|------------|
+| Data type | half (fp16) | bf16 |
+| Threads | 128 (4 warps) | 64 (2 warps) |
+| MMA | WMMA | TK warp::mma |
+| Parallelism | Warp-level softmax | Row-parallel |
 
 ## Files
 
-- `attn_chunk_first.cu` - Main kernel implementation
-- `harness.impl` - Test harness for running the kernel
-- `gentests.py` - Python script to generate test data
-- `Makefile` - Build configuration
-
-## Building
-
-```bash
-# Set THUNDERKITTENS_ROOT environment variable if not already set
-export THUNDERKITTENS_ROOT=/path/to/ThunderKittens
-
-# Build the test binary
-make
-```
-
-## Running Tests
-
-1. Generate test data:
-```bash
-python gentests.py randn
-# This creates: randn_16_64_128.txt
-```
-
-2. Run the test:
-```bash
-./attn_chunk_first randn_16_64_128.txt
-```
-
-## Test Configuration
-
-The test is configured for:
-- `N_SEQS = 16`: Number of sequences attending to each chunk
-- `CHUNK_SIZE = 64`: Size of K/V chunks
-- `D_HEAD = 128`: Head dimension
-- `N_HEADS = 4`: Number of attention heads
-- `N_CHUNKS = 2`: Number of chunks to test
-
-These can be modified in both `gentests.py` and `harness.impl` (they must match).
-
-## Test Types
-
-- `randn`: Random normal data (default)
-- `ones`: All ones
-- `simple`: Simple test with smaller values and identity V matrices
-
-## Implementation Notes
-
-This ThunderKittens version makes several simplifying assumptions compared to the full CUDA implementation:
-
-1. **Data type**: Currently uses `float` instead of `half` for all computations
-2. **Precision**: Single precision throughout, not using double-buffer approach
-3. **Memory**: Allocates separate buffers for K and V (not reusing memory)
-4. **Simplified calling pattern**: Tests individual chunk attention without full pipeline integration
-
-These simplifications are documented in code comments and are acceptable for testing the core kernel logic.
-
-## Expected Output
-
-The test checks three outputs against reference values:
-- Attention outputs: `softmax(Q @ K.T) @ V`
-- Max values: Maximum attention scores per row (for numerical stability)
-- Sum values: Sum of exp(attention scores) per row (for normalization)
-
-Success criteria:
-- Maximum difference < 0.1 (loose tolerance due to float precision)
-- No NaN values
-
-## Troubleshooting
-
-If the build fails:
-- Ensure `THUNDERKITTENS_ROOT` is set correctly
-- Check that you have CUDA toolkit installed
-- Verify GPU architecture in Makefile matches your GPU
-
-If tests fail:
-- Check that test data was generated successfully
-- Verify dimensions match between gentests.py and harness.impl
-- Check shared memory limits for your GPU
-
+- `attn_chunk_first.cu` - Kernel with inline documentation
+- `harness.impl` - Test harness (included by kernel)
+- `gentests.py` - Reference computation & test generation
+- `run_tests.sh` - Parallel test runner

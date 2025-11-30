@@ -1,57 +1,93 @@
 #!/bin/bash
-# Fast parallel test runner with streaming output
+# Auto-generated test runner
+# Usage: ./run_tests.sh [JOBS]   (default: 4 parallel jobs)
 
-# Number of parallel jobs (adjust based on GPU memory)
-PARALLEL_JOBS=${PARALLEL_JOBS:-4}
+JOBS=${1:-4}
+TOTAL=36
+RESULTS_FILE=$(mktemp)
 
-# Get list of test files
-TESTS=(tests/*.txt)
-TOTAL=${#TESTS[@]}
-
-echo "Running $TOTAL tests with $PARALLEL_JOBS parallel jobs..."
+echo "Running $TOTAL tests with $JOBS parallel jobs..."
 echo ""
 
-# Temp file for results
-RESULTS_FILE=$(mktemp)
-trap "rm -f $RESULTS_FILE" EXIT
-
-# Function to run a single test
+# Function to run a single test and output result (streams to terminal)
 run_test() {
-    local TEST_FILE="$1"
-    local TEST_NAME=$(basename "$TEST_FILE")
-
-    # Run test, capture output in memory
-    OUTPUT=$(./attn_chunk_first "$TEST_FILE" 2>&1)
-    EXIT_CODE=$?
-
-    if [ $EXIT_CODE -eq 0 ]; then
-        echo "✓ $TEST_NAME"
+    TEST="$1"
+    RESULTS_FILE="$2"
+    NAME=$(basename "$TEST")
+    OUTPUT=$(./attn_chunk_first "$TEST" 2>&1)
+    if [ $? -eq 0 ]; then
+        echo "✓ $NAME"
         echo "PASS" >> "$RESULTS_FILE"
     else
-        # Extract summary
-        SUMMARY=$(echo "$OUTPUT" | grep "^SUMMARY:" | head -1)
-        echo "✗ $TEST_NAME - ${SUMMARY#SUMMARY: }"
-        echo "FAIL:$TEST_NAME" >> "$RESULTS_FILE"
+        SUMMARY=$(echo "$OUTPUT" | grep "SUMMARY:" | head -1)
+        echo "✗ $NAME - $SUMMARY"
+        echo "FAIL:$NAME" >> "$RESULTS_FILE"
     fi
 }
 export -f run_test
-export RESULTS_FILE
 
-# Run tests in parallel, output streams as jobs complete
-printf '%s\n' "${TESTS[@]}" | xargs -P $PARALLEL_JOBS -I {} bash -c 'run_test "$@"' _ {}
+# Run tests in parallel, streaming output
+cat << 'TESTLIST' | xargs -P "$JOBS" -I {} bash -c 'run_test "{}" "'$RESULTS_FILE'"'
+tests/randn_s16_h1_c1.txt
+tests/randn_s16_h1_c2.txt
+tests/randn_s16_h1_c4.txt
+tests/randn_s16_h4_c1.txt
+tests/randn_s16_h4_c2.txt
+tests/randn_s16_h4_c4.txt
+tests/randn_s32_h1_c1.txt
+tests/randn_s32_h1_c2.txt
+tests/randn_s32_h1_c4.txt
+tests/randn_s32_h4_c1.txt
+tests/randn_s32_h4_c2.txt
+tests/randn_s32_h4_c4.txt
+tests/randn_s8_h1_c1.txt
+tests/randn_s8_h1_c2.txt
+tests/randn_s8_h1_c4.txt
+tests/randn_s8_h4_c1.txt
+tests/randn_s8_h4_c2.txt
+tests/randn_s8_h4_c4.txt
+tests/small_s16_h1_c1.txt
+tests/small_s16_h1_c2.txt
+tests/small_s16_h1_c4.txt
+tests/small_s16_h4_c1.txt
+tests/small_s16_h4_c2.txt
+tests/small_s16_h4_c4.txt
+tests/small_s32_h1_c1.txt
+tests/small_s32_h1_c2.txt
+tests/small_s32_h1_c4.txt
+tests/small_s32_h4_c1.txt
+tests/small_s32_h4_c2.txt
+tests/small_s32_h4_c4.txt
+tests/small_s8_h1_c1.txt
+tests/small_s8_h1_c2.txt
+tests/small_s8_h1_c4.txt
+tests/small_s8_h4_c1.txt
+tests/small_s8_h4_c2.txt
+tests/small_s8_h4_c4.txt
+TESTLIST
 
 # Count results
-PASSED=$(grep -c "^PASS" "$RESULTS_FILE" 2>/dev/null || echo 0)
-FAILED=$(grep -c "^FAIL" "$RESULTS_FILE" 2>/dev/null || echo 0)
+PASSED=$(grep -c "^PASS$" "$RESULTS_FILE" || true)
+PASSED=${PASSED:-0}
+FAILED=0
+FAILED_TESTS=""
 
+while IFS= read -r line; do
+    if [[ "$line" == FAIL:* ]]; then
+        ((FAILED++))
+        NAME="${line#FAIL:}"
+        FAILED_TESTS="$FAILED_TESTS\n  $NAME"
+    fi
+done < <(grep "^FAIL:" "$RESULTS_FILE" 2>/dev/null || true)
+
+rm -f "$RESULTS_FILE"
+
+TOTAL_RUN=$((PASSED + FAILED))
 echo ""
 echo "================================"
-echo "PASSED: $PASSED / $((PASSED + FAILED))"
-
-if [ $FAILED -gt 0 ]; then
-    echo ""
-    echo "Failed tests:"
-    grep "^FAIL:" "$RESULTS_FILE" | cut -d: -f2 | sed 's/^/  /'
+echo "PASSED: $PASSED / $TOTAL_RUN"
+if [ "$FAILED" -gt 0 ]; then
+    echo -e "FAILED:$FAILED_TESTS"
     exit 1
 else
     echo "All tests passed!"
