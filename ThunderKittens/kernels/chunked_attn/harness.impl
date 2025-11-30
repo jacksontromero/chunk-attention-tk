@@ -12,198 +12,231 @@ constexpr int CHUNK_SIZE = 64;
 constexpr int D_HEAD = 128;
 constexpr int N_HEADS = 4;
 constexpr int N_CHUNKS = 2;
-
-// Block size must match kernel (1 warp = 32 threads)
 constexpr int BLOCK_LAUNCH_SIZE = 32;
 
-// ===== Debug configuration =====
-#define HARNESS_DEBUG 1       // Print debug info
-#define HARNESS_VERBOSE 0     // Print even more details
+// Derived sizes
+constexpr int Q_SIZE = N_SEQS * N_HEADS * D_HEAD;
+constexpr int KV_CHUNK_SIZE = N_HEADS * CHUNK_SIZE * D_HEAD;
+constexpr int OUT_CHUNK_SIZE = N_HEADS * N_SEQS * D_HEAD;
+constexpr int MAX_SUM_CHUNK_SIZE = N_HEADS * N_SEQS;
 
-#define CudaCheckError()    __cudaCheckError( __FILE__, __LINE__ )
-inline void __cudaCheckError( const char *file, const int line ) {
+#define CudaCheckError() __cudaCheckError(__FILE__, __LINE__)
+inline void __cudaCheckError(const char *file, const int line) {
     cudaError err = cudaGetLastError();
-    if ( cudaSuccess != err ) {
-        fprintf( stderr, "cudaCheckError() failed at %s:%i : %s\n",
-                 file, line, cudaGetErrorString( err ) );
-        exit( -1 );
+    if (cudaSuccess != err) {
+        fprintf(stderr, "CUDA error at %s:%i: %s\n", file, line, cudaGetErrorString(err));
+        exit(-1);
     }
     err = cudaDeviceSynchronize();
-    if( cudaSuccess != err ) {
-        fprintf( stderr, "cudaCheckError() with sync failed at %s:%i : %s\n",
-                 file, line, cudaGetErrorString( err ) );
-        exit( -1 );
+    if (cudaSuccess != err) {
+        fprintf(stderr, "CUDA sync error at %s:%i: %s\n", file, line, cudaGetErrorString(err));
+        exit(-1);
     }
 }
 
+// Global verbosity flag
+bool g_verbose = false;
+
 template<typename T>
-void read_array(std::ifstream& infile, T* arr, int count, const char* name) {
-#if HARNESS_VERBOSE
-    std::cout << "  Loading " << name << " (" << count << " elements)..." << std::endl;
-#endif
-    for(int i = 0; i < count; i++) {
+void read_array(std::ifstream& infile, T* arr, int count) {
+    for (int i = 0; i < count; i++) {
         float val;
         infile >> val;
         arr[i] = static_cast<T>(val);
     }
 }
 
-// Helper to convert float array to bf16
 void float_to_bf16(const float* src, bf16* dst, int count) {
     for (int i = 0; i < count; i++) {
         dst[i] = __float2bfloat16(src[i]);
     }
 }
 
+struct TestResult {
+    bool passed;
+    float attn_max_abs, attn_avg_abs, attn_max_rel, attn_avg_rel;
+    float maxs_max_abs, maxs_avg_abs, maxs_max_rel, maxs_avg_rel;
+    float sums_max_abs, sums_avg_abs, sums_max_rel, sums_avg_rel;
+    int attn_nan_count, maxs_nan_count, sums_nan_count;
+};
+
+TestResult check_correctness(
+    float* h_attns, float* h_maxs, float* h_sums,
+    float* h_out_ref[], float* h_maxs_ref[], float* h_sums_ref[],
+    int* h_offsets
+) {
+    TestResult r = {true, 0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0};
+    int attn_count = 0, maxs_count = 0, sums_count = 0;
+
+    for (int chunk = 0; chunk < N_CHUNKS; chunk++) {
+        int offset = h_offsets[chunk];
+
+        // Check attention outputs
+        for (int i = 0; i < OUT_CHUNK_SIZE; i++) {
+            int idx = offset * N_HEADS * D_HEAD + i;
+            float actual = h_attns[idx];
+            float expected = h_out_ref[chunk][i];
+            float abs_diff = std::abs(actual - expected);
+            float rel_diff = abs_diff / std::max(std::abs(expected), 1.0f);
+
+            if (std::isnan(actual) || std::isinf(actual)) {
+                r.attn_nan_count++;
+                r.passed = false;
+            } else {
+                r.attn_avg_abs += abs_diff;
+                r.attn_avg_rel += rel_diff;
+                r.attn_max_abs = std::max(r.attn_max_abs, abs_diff);
+                r.attn_max_rel = std::max(r.attn_max_rel, rel_diff);
+                attn_count++;
+
+                float tol = std::max(0.1f, std::abs(expected) * 0.01f);
+                if (abs_diff > tol) r.passed = false;
+            }
+        }
+
+        // Check max/sum outputs
+        for (int i = 0; i < MAX_SUM_CHUNK_SIZE; i++) {
+            int idx = offset * N_HEADS + i;
+
+            float maxs_abs = std::abs(h_maxs[idx] - h_maxs_ref[chunk][i]);
+            float sums_abs = std::abs(h_sums[idx] - h_sums_ref[chunk][i]);
+            float maxs_rel = maxs_abs / std::max(std::abs(h_maxs_ref[chunk][i]), 1.0f);
+            float sums_rel = sums_abs / std::max(std::abs(h_sums_ref[chunk][i]), 1.0f);
+
+            if (std::isnan(h_maxs[idx])) r.maxs_nan_count++;
+            if (std::isnan(h_sums[idx])) r.sums_nan_count++;
+
+            r.maxs_avg_abs += maxs_abs; r.maxs_avg_rel += maxs_rel;
+            r.sums_avg_abs += sums_abs; r.sums_avg_rel += sums_rel;
+            r.maxs_max_abs = std::max(r.maxs_max_abs, maxs_abs);
+            r.sums_max_abs = std::max(r.sums_max_abs, sums_abs);
+            r.maxs_max_rel = std::max(r.maxs_max_rel, maxs_rel);
+            r.sums_max_rel = std::max(r.sums_max_rel, sums_rel);
+            maxs_count++; sums_count++;
+
+            float maxs_tol = std::max(0.1f, std::abs(h_maxs_ref[chunk][i]) * 0.01f);
+            float sums_tol = std::max(0.1f, std::abs(h_sums_ref[chunk][i]) * 0.01f);
+            if (maxs_abs > maxs_tol || std::isnan(maxs_abs)) r.passed = false;
+            if (sums_abs > sums_tol || std::isnan(sums_abs)) r.passed = false;
+        }
+    }
+
+    if (attn_count > 0) { r.attn_avg_abs /= attn_count; r.attn_avg_rel /= attn_count; }
+    if (maxs_count > 0) { r.maxs_avg_abs /= maxs_count; r.maxs_avg_rel /= maxs_count; }
+    if (sums_count > 0) { r.sums_avg_abs /= sums_count; r.sums_avg_rel /= sums_count; }
+
+    return r;
+}
+
+void print_result(const TestResult& r, bool verbose) {
+    if (verbose) {
+        std::cout << "\n=== Results ===" << std::endl;
+        std::cout << "Attention: " << (r.attn_nan_count == 0 && r.attn_max_abs < 1.0 ? "OK" : "ISSUES") << std::endl;
+        std::cout << "  Abs: max=" << r.attn_max_abs << ", avg=" << r.attn_avg_abs << std::endl;
+        std::cout << "  Rel: max=" << (r.attn_max_rel*100) << "%, avg=" << (r.attn_avg_rel*100) << "%" << std::endl;
+
+        std::cout << "Max values:" << std::endl;
+        std::cout << "  Abs: max=" << r.maxs_max_abs << ", avg=" << r.maxs_avg_abs << std::endl;
+        std::cout << "  Rel: max=" << (r.maxs_max_rel*100) << "%, avg=" << (r.maxs_avg_rel*100) << "%" << std::endl;
+
+        std::cout << "Sum values:" << std::endl;
+        std::cout << "  Abs: max=" << r.sums_max_abs << ", avg=" << r.sums_avg_abs << std::endl;
+        std::cout << "  Rel: max=" << (r.sums_max_rel*100) << "%, avg=" << (r.sums_avg_rel*100) << "%" << std::endl;
+
+        if (r.attn_nan_count) std::cout << "Attention NaN/Inf: " << r.attn_nan_count << std::endl;
+        if (r.maxs_nan_count) std::cout << "Max NaN: " << r.maxs_nan_count << std::endl;
+        if (r.sums_nan_count) std::cout << "Sum NaN: " << r.sums_nan_count << std::endl;
+    }
+
+    std::cout << (r.passed ? "PASSED" : "FAILED") << std::endl;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <test_file.txt>" << std::endl;
+        std::cerr << "Usage: " << argv[0] << " <test_file.txt> [-v]" << std::endl;
         return 1;
     }
 
-    std::cout << "=== Chunked Attention TK Test Harness ===" << std::endl;
-    std::cout << "Configuration:" << std::endl;
-    std::cout << "  N_SEQS=" << N_SEQS << ", CHUNK_SIZE=" << CHUNK_SIZE << std::endl;
-    std::cout << "  D_HEAD=" << D_HEAD << ", N_HEADS=" << N_HEADS << std::endl;
-    std::cout << "  N_CHUNKS=" << N_CHUNKS << ", BLOCK_SIZE=" << BLOCK_LAUNCH_SIZE << std::endl;
+    const char* test_file = argv[1];
+    g_verbose = (argc > 2 && strcmp(argv[2], "-v") == 0);
 
-    // ===== STEP 1: Allocate host memory =====
-    constexpr int Q_SIZE = N_SEQS * N_HEADS * D_HEAD;
-    constexpr int KV_CHUNK_SIZE = N_HEADS * CHUNK_SIZE * D_HEAD;
-    constexpr int OUT_CHUNK_SIZE = N_HEADS * N_SEQS * D_HEAD;
-    constexpr int MAX_SUM_CHUNK_SIZE = N_HEADS * N_SEQS;
+    if (g_verbose) {
+        std::cout << "=== Chunked Attention TK Test ===" << std::endl;
+        std::cout << "Config: N_SEQS=" << N_SEQS << ", CHUNK_SIZE=" << CHUNK_SIZE
+                  << ", D_HEAD=" << D_HEAD << ", N_HEADS=" << N_HEADS << std::endl;
+    }
 
-    std::cout << "\nSizes:" << std::endl;
-    std::cout << "  Q: " << Q_SIZE << " elements" << std::endl;
-    std::cout << "  KV per chunk: " << KV_CHUNK_SIZE << " elements" << std::endl;
-    std::cout << "  Output per chunk: " << OUT_CHUNK_SIZE << " elements" << std::endl;
+    // Allocate host memory
+    float *h_q = new float[Q_SIZE];
+    float *h_k[N_CHUNKS], *h_v[N_CHUNKS];
+    float *h_out_ref[N_CHUNKS], *h_maxs_ref[N_CHUNKS], *h_sums_ref[N_CHUNKS];
 
-    // Host arrays (float for reading from file)
-    float *h_q_float = new float[Q_SIZE];
-    float *h_k_float[N_CHUNKS];
-    float *h_v_float[N_CHUNKS];
-    float *h_out_ref[N_CHUNKS];
-    float *h_maxs_ref[N_CHUNKS];
-    float *h_sums_ref[N_CHUNKS];
-
-    for(int i = 0; i < N_CHUNKS; i++) {
-        h_k_float[i] = new float[KV_CHUNK_SIZE];
-        h_v_float[i] = new float[KV_CHUNK_SIZE];
+    for (int i = 0; i < N_CHUNKS; i++) {
+        h_k[i] = new float[KV_CHUNK_SIZE];
+        h_v[i] = new float[KV_CHUNK_SIZE];
         h_out_ref[i] = new float[OUT_CHUNK_SIZE];
         h_maxs_ref[i] = new float[MAX_SUM_CHUNK_SIZE];
         h_sums_ref[i] = new float[MAX_SUM_CHUNK_SIZE];
     }
 
-    // ===== STEP 2: Load test data from file =====
-    std::cout << "\nLoading test data from: " << argv[1] << std::endl;
-    std::ifstream infile(argv[1]);
+    // Load test data
+    std::ifstream infile(test_file);
     if (!infile.is_open()) {
-        std::cerr << "Failed to open " << argv[1] << std::endl;
+        std::cerr << "Failed to open " << test_file << std::endl;
         return 1;
     }
 
-    read_array(infile, h_q_float, Q_SIZE, "Q");
-    for(int i = 0; i < N_CHUNKS; i++) {
-        char name[64];
-        sprintf(name, "K chunk %d", i);
-        read_array(infile, h_k_float[i], KV_CHUNK_SIZE, name);
-    }
-    for(int i = 0; i < N_CHUNKS; i++) {
-        char name[64];
-        sprintf(name, "V chunk %d", i);
-        read_array(infile, h_v_float[i], KV_CHUNK_SIZE, name);
-    }
-    for(int i = 0; i < N_CHUNKS; i++) {
-        char name[64];
-        sprintf(name, "Output ref chunk %d", i);
-        read_array(infile, h_out_ref[i], OUT_CHUNK_SIZE, name);
-    }
-    for(int i = 0; i < N_CHUNKS; i++) {
-        char name[64];
-        sprintf(name, "Maxs ref chunk %d", i);
-        read_array(infile, h_maxs_ref[i], MAX_SUM_CHUNK_SIZE, name);
-    }
-    for(int i = 0; i < N_CHUNKS; i++) {
-        char name[64];
-        sprintf(name, "Sums ref chunk %d", i);
-        read_array(infile, h_sums_ref[i], MAX_SUM_CHUNK_SIZE, name);
-    }
+    read_array(infile, h_q, Q_SIZE);
+    for (int i = 0; i < N_CHUNKS; i++) read_array(infile, h_k[i], KV_CHUNK_SIZE);
+    for (int i = 0; i < N_CHUNKS; i++) read_array(infile, h_v[i], KV_CHUNK_SIZE);
+    for (int i = 0; i < N_CHUNKS; i++) read_array(infile, h_out_ref[i], OUT_CHUNK_SIZE);
+    for (int i = 0; i < N_CHUNKS; i++) read_array(infile, h_maxs_ref[i], MAX_SUM_CHUNK_SIZE);
+    for (int i = 0; i < N_CHUNKS; i++) read_array(infile, h_sums_ref[i], MAX_SUM_CHUNK_SIZE);
     infile.close();
-    std::cout << "Test data loaded successfully!" << std::endl;
 
-#if HARNESS_DEBUG
-    // Print some reference values for debugging
-    std::cout << "\nReference values (first few):" << std::endl;
-    std::cout << "  Q[0:3] = " << h_q_float[0] << ", " << h_q_float[1] << ", " << h_q_float[2] << std::endl;
-    std::cout << "  K[0][0:3] = " << h_k_float[0][0] << ", " << h_k_float[0][1] << ", " << h_k_float[0][2] << std::endl;
-    std::cout << "  V[0][0:3] = " << h_v_float[0][0] << ", " << h_v_float[0][1] << ", " << h_v_float[0][2] << std::endl;
-    std::cout << "  Out_ref[0][0:3] = " << h_out_ref[0][0] << ", " << h_out_ref[0][1] << ", " << h_out_ref[0][2] << std::endl;
-    std::cout << "  Maxs_ref[0][0:3] = " << h_maxs_ref[0][0] << ", " << h_maxs_ref[0][1] << ", " << h_maxs_ref[0][2] << std::endl;
-    std::cout << "  Sums_ref[0][0:3] = " << h_sums_ref[0][0] << ", " << h_sums_ref[0][1] << ", " << h_sums_ref[0][2] << std::endl;
-#endif
+    if (g_verbose) std::cout << "Test data loaded" << std::endl;
 
-    // ===== STEP 3: Allocate device memory =====
-    std::cout << "\nAllocating device memory..." << std::endl;
-
-    // IMPORTANT: Q, K, V are bf16 on device!
-    bf16 *d_q;
-    bf16 *d_k[N_CHUNKS];
-    bf16 *d_v[N_CHUNKS];
-    float *d_attns;
-    float *d_maxs;
-    float *d_sums;
-    void **d_keys_ptrs;
-    void **d_values_ptrs;
+    // Allocate device memory
+    bf16 *d_q, *d_k[N_CHUNKS], *d_v[N_CHUNKS];
+    float *d_attns, *d_maxs, *d_sums;
+    void **d_keys_ptrs, **d_values_ptrs;
     int *d_offsets, *d_begins, *d_ends;
 
-    // Allocate with correct bf16 sizes
     cudaMalloc(&d_q, Q_SIZE * sizeof(bf16));
-    for(int i = 0; i < N_CHUNKS; i++) {
+    for (int i = 0; i < N_CHUNKS; i++) {
         cudaMalloc(&d_k[i], KV_CHUNK_SIZE * sizeof(bf16));
         cudaMalloc(&d_v[i], KV_CHUNK_SIZE * sizeof(bf16));
     }
 
-    // Output buffers (float) - accumulate all chunks
-    const int total_output_size = N_CHUNKS * OUT_CHUNK_SIZE;
-    const int total_maxsum_size = N_CHUNKS * MAX_SUM_CHUNK_SIZE;
-    cudaMalloc(&d_attns, total_output_size * sizeof(float));
-    cudaMalloc(&d_maxs, total_maxsum_size * sizeof(float));
-    cudaMalloc(&d_sums, total_maxsum_size * sizeof(float));
+    const int total_out = N_CHUNKS * OUT_CHUNK_SIZE;
+    const int total_maxsum = N_CHUNKS * MAX_SUM_CHUNK_SIZE;
+    cudaMalloc(&d_attns, total_out * sizeof(float));
+    cudaMalloc(&d_maxs, total_maxsum * sizeof(float));
+    cudaMalloc(&d_sums, total_maxsum * sizeof(float));
+    cudaMemset(d_attns, 0, total_out * sizeof(float));
+    cudaMemset(d_maxs, 0, total_maxsum * sizeof(float));
+    cudaMemset(d_sums, 0, total_maxsum * sizeof(float));
 
-    // Initialize outputs to zero
-    cudaMemset(d_attns, 0, total_output_size * sizeof(float));
-    cudaMemset(d_maxs, 0, total_maxsum_size * sizeof(float));
-    cudaMemset(d_sums, 0, total_maxsum_size * sizeof(float));
-
-    // ===== STEP 4: Convert float to bf16 and copy to device =====
-    std::cout << "Converting float to bf16 and copying to device..." << std::endl;
-
-    // Convert Q
+    // Convert and copy Q, K, V
     bf16 *h_q_bf16 = new bf16[Q_SIZE];
-    float_to_bf16(h_q_float, h_q_bf16, Q_SIZE);
+    float_to_bf16(h_q, h_q_bf16, Q_SIZE);
     cudaMemcpy(d_q, h_q_bf16, Q_SIZE * sizeof(bf16), cudaMemcpyHostToDevice);
     delete[] h_q_bf16;
 
-    // Convert and copy K, V for each chunk
-    for(int i = 0; i < N_CHUNKS; i++) {
+    for (int i = 0; i < N_CHUNKS; i++) {
         bf16 *h_k_bf16 = new bf16[KV_CHUNK_SIZE];
         bf16 *h_v_bf16 = new bf16[KV_CHUNK_SIZE];
-
-        float_to_bf16(h_k_float[i], h_k_bf16, KV_CHUNK_SIZE);
-        float_to_bf16(h_v_float[i], h_v_bf16, KV_CHUNK_SIZE);
-
+        float_to_bf16(h_k[i], h_k_bf16, KV_CHUNK_SIZE);
+        float_to_bf16(h_v[i], h_v_bf16, KV_CHUNK_SIZE);
         cudaMemcpy(d_k[i], h_k_bf16, KV_CHUNK_SIZE * sizeof(bf16), cudaMemcpyHostToDevice);
         cudaMemcpy(d_v[i], h_v_bf16, KV_CHUNK_SIZE * sizeof(bf16), cudaMemcpyHostToDevice);
-
         delete[] h_k_bf16;
         delete[] h_v_bf16;
     }
-    CudaCheckError();
 
-    // ===== STEP 5: Setup K/V pointer arrays =====
-    void *h_keys_ptrs[N_CHUNKS];
-    void *h_values_ptrs[N_CHUNKS];
-    for(int i = 0; i < N_CHUNKS; i++) {
+    // Setup pointer arrays
+    void *h_keys_ptrs[N_CHUNKS], *h_values_ptrs[N_CHUNKS];
+    for (int i = 0; i < N_CHUNKS; i++) {
         h_keys_ptrs[i] = d_k[i];
         h_values_ptrs[i] = d_v[i];
     }
@@ -212,17 +245,13 @@ int main(int argc, char **argv) {
     cudaMemcpy(d_keys_ptrs, h_keys_ptrs, N_CHUNKS * sizeof(void*), cudaMemcpyHostToDevice);
     cudaMemcpy(d_values_ptrs, h_values_ptrs, N_CHUNKS * sizeof(void*), cudaMemcpyHostToDevice);
 
-    // ===== STEP 6: Setup chunk metadata =====
-    int h_begins[N_CHUNKS];
-    int h_ends[N_CHUNKS];
-    int h_offsets[N_CHUNKS];
-
-    for(int i = 0; i < N_CHUNKS; i++) {
-        h_begins[i] = 0;            // All chunks process seqs [0, N_SEQS)
+    // Setup chunk metadata
+    int h_begins[N_CHUNKS], h_ends[N_CHUNKS], h_offsets[N_CHUNKS];
+    for (int i = 0; i < N_CHUNKS; i++) {
+        h_begins[i] = 0;
         h_ends[i] = N_SEQS;
-        h_offsets[i] = i * N_SEQS;  // Sequential offsets for output
+        h_offsets[i] = i * N_SEQS;
     }
-
     cudaMalloc(&d_begins, N_CHUNKS * sizeof(int));
     cudaMalloc(&d_ends, N_CHUNKS * sizeof(int));
     cudaMalloc(&d_offsets, N_CHUNKS * sizeof(int));
@@ -231,283 +260,72 @@ int main(int argc, char **argv) {
     cudaMemcpy(d_offsets, h_offsets, N_CHUNKS * sizeof(int), cudaMemcpyHostToDevice);
     CudaCheckError();
 
-#if HARNESS_DEBUG
-    std::cout << "\nChunk metadata:" << std::endl;
-    for(int i = 0; i < N_CHUNKS; i++) {
-        std::cout << "  Chunk " << i << ": begins=" << h_begins[i]
-                  << ", ends=" << h_ends[i] << ", offset=" << h_offsets[i] << std::endl;
-    }
-#endif
-
-    // ===== STEP 7: Setup kernel globals =====
+    // Setup kernel globals
     using globals_t = attn_chunk_first_globals<N_SEQS, D_HEAD>;
 
-    // Construct gl objects with correct dimensions
-    // Q is stored as [N_SEQS, N_HEADS, D_HEAD], we view it as [1, 1, N_SEQS, N_HEADS*D_HEAD]
-    // This gives row_stride = N_HEADS * D_HEAD, and we load D_HEAD cols starting at head_idx * D_HEAD
     auto gQ = gl<bf16, 1, 1, N_SEQS, -1, st<bf16, N_SEQS, D_HEAD>>(
         d_q, nullptr, nullptr, nullptr, N_HEADS * D_HEAD);
-
-    // gAttns: [1, 1, total_seqs * n_heads, d_head] treated as 1D array
-    auto gAttns = gl<float, -1, -1, -1, -1>(
-        d_attns, 1, 1, N_CHUNKS * N_HEADS * N_SEQS, D_HEAD);
-
-    // gMaxs/gSums: [1, 1, 1, total_maxsum_size] treated as 1D array
-    auto gMaxs = gl<float, -1, -1, -1, -1>(
-        d_maxs, 1, 1, 1, total_maxsum_size);
-
-    auto gSums = gl<float, -1, -1, -1, -1>(
-        d_sums, 1, 1, 1, total_maxsum_size);
-
-    auto gOffsets = gl<int, -1, -1, -1, -1>(
-        d_offsets, 1, 1, 1, N_CHUNKS);
-
-    auto gBegins = gl<int, -1, -1, -1, -1>(
-        d_begins, 1, 1, 1, N_CHUNKS);
-
-    auto gEnds = gl<int, -1, -1, -1, -1>(
-        d_ends, 1, 1, 1, N_CHUNKS);
+    auto gAttns = gl<float, -1, -1, -1, -1>(d_attns, 1, 1, N_CHUNKS * N_HEADS * N_SEQS, D_HEAD);
+    auto gMaxs = gl<float, -1, -1, -1, -1>(d_maxs, 1, 1, 1, total_maxsum);
+    auto gSums = gl<float, -1, -1, -1, -1>(d_sums, 1, 1, 1, total_maxsum);
+    auto gOffsets = gl<int, -1, -1, -1, -1>(d_offsets, 1, 1, 1, N_CHUNKS);
+    auto gBegins = gl<int, -1, -1, -1, -1>(d_begins, 1, 1, 1, N_CHUNKS);
+    auto gEnds = gl<int, -1, -1, -1, -1>(d_ends, 1, 1, 1, N_CHUNKS);
 
     globals_t g{
-        .gAttns = gAttns,
-        .gMaxs = gMaxs,
-        .gSums = gSums,
-        .gOffsets = gOffsets,
-        .gBegins = gBegins,
-        .gEnds = gEnds,
-        .gQ = gQ,
-        .gKeys = d_keys_ptrs,
-        .gValues = d_values_ptrs,
+        .gAttns = gAttns, .gMaxs = gMaxs, .gSums = gSums,
+        .gOffsets = gOffsets, .gBegins = gBegins, .gEnds = gEnds,
+        .gQ = gQ, .gKeys = d_keys_ptrs, .gValues = d_values_ptrs,
         .dim_scale = 1.0f / sqrtf(static_cast<float>(D_HEAD)),
         .n_heads = N_HEADS
     };
 
-    // ===== STEP 8: Calculate shared memory size =====
-    // Shared memory layout (must match kernel allocations):
-    // - Qs: st<bf16, N_SEQS, D_HEAD>
-    // - Ks: st<bf16, CHUNK_SIZE, D_HEAD>
-    // - Vs: st<bf16, CHUNK_SIZE, D_HEAD>
-    // - out_smem: st<float, N_SEQS, D_HEAD>
+    // Calculate shared memory
+    size_t smem = sizeof(st<bf16, N_SEQS, D_HEAD>) +
+                  sizeof(st<bf16, CHUNK_SIZE, D_HEAD>) * 2 +
+                  sizeof(st<float, N_SEQS, D_HEAD>);
+    smem = ((smem + 4095) / 4096) * 4096;
 
-    size_t Qs_size = sizeof(st<bf16, N_SEQS, D_HEAD>);
-    size_t Ks_size = sizeof(st<bf16, CHUNK_SIZE, D_HEAD>);
-    size_t Vs_size = sizeof(st<bf16, CHUNK_SIZE, D_HEAD>);
-    size_t out_smem_size = sizeof(st<float, N_SEQS, D_HEAD>);
-
-    size_t shared_mem_size = Qs_size + Ks_size + Vs_size + out_smem_size;
-    // Add some padding for alignment
-    shared_mem_size = ((shared_mem_size + 4095) / 4096) * 4096;
-
-    std::cout << "\nShared memory breakdown:" << std::endl;
-    std::cout << "  Qs: " << Qs_size << " bytes" << std::endl;
-    std::cout << "  Ks: " << Ks_size << " bytes" << std::endl;
-    std::cout << "  Vs: " << Vs_size << " bytes" << std::endl;
-    std::cout << "  out_smem: " << out_smem_size << " bytes" << std::endl;
-    std::cout << "  Total (padded): " << shared_mem_size << " bytes" << std::endl;
-
-    // ===== STEP 9: Set kernel attributes =====
-    cudaFuncSetAttribute(
-        attn_chunk_first_tk<N_SEQS, CHUNK_SIZE, D_HEAD>,
-        cudaFuncAttributeMaxDynamicSharedMemorySize,
-        shared_mem_size
-    );
+    cudaFuncSetAttribute(attn_chunk_first_tk<N_SEQS, CHUNK_SIZE, D_HEAD>,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     CudaCheckError();
 
-    // ===== STEP 10: Launch kernel =====
+    // Launch kernel
     dim3 grid(N_HEADS, N_CHUNKS);
     dim3 block(BLOCK_LAUNCH_SIZE);
 
-    std::cout << "\n=== Launching kernel ===" << std::endl;
-    std::cout << "  Grid: (" << grid.x << ", " << grid.y << ")" << std::endl;
-    std::cout << "  Block: " << block.x << std::endl;
-    std::cout << "  Shared memory: " << shared_mem_size << " bytes" << std::endl;
-    std::cout << "  dim_scale: " << g.dim_scale << std::endl;
+    if (g_verbose) std::cout << "Launching kernel..." << std::endl;
 
     cudaDeviceSynchronize();
-    const auto start = std::chrono::high_resolution_clock::now();
-
-    attn_chunk_first_tk<N_SEQS, CHUNK_SIZE, D_HEAD><<<grid, block, shared_mem_size>>>(g);
-
+    attn_chunk_first_tk<N_SEQS, CHUNK_SIZE, D_HEAD><<<grid, block, smem>>>(g);
     cudaDeviceSynchronize();
-    const auto finish = std::chrono::high_resolution_clock::now();
     CudaCheckError();
 
-    std::cout << "\n=== Kernel completed ===" << std::endl;
-    std::cout << "Execution time: " << std::chrono::duration_cast<std::chrono::microseconds>(finish - start).count()
-              << " us" << std::endl;
+    // Copy results back
+    float *h_attns = new float[total_out];
+    float *h_maxs = new float[total_maxsum];
+    float *h_sums = new float[total_maxsum];
+    cudaMemcpy(h_attns, d_attns, total_out * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_maxs, d_maxs, total_maxsum * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_sums, d_sums, total_maxsum * sizeof(float), cudaMemcpyDeviceToHost);
 
-    // ===== STEP 11: Copy results back =====
-    float *h_attns = new float[total_output_size];
-    float *h_maxs = new float[total_maxsum_size];
-    float *h_sums = new float[total_maxsum_size];
+    // Check correctness
+    TestResult result = check_correctness(h_attns, h_maxs, h_sums, h_out_ref, h_maxs_ref, h_sums_ref, h_offsets);
+    print_result(result, g_verbose);
 
-    cudaMemcpy(h_attns, d_attns, total_output_size * sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_maxs, d_maxs, total_maxsum_size * sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_sums, d_sums, total_maxsum_size * sizeof(float), cudaMemcpyDeviceToHost);
-    CudaCheckError();
-
-#if HARNESS_DEBUG
-    std::cout << "\nOutput values (first few):" << std::endl;
-    std::cout << "  attn[0:3] = " << h_attns[0] << ", " << h_attns[1] << ", " << h_attns[2] << std::endl;
-    std::cout << "  maxs[0:3] = " << h_maxs[0] << ", " << h_maxs[1] << ", " << h_maxs[2] << std::endl;
-    std::cout << "  sums[0:3] = " << h_sums[0] << ", " << h_sums[1] << ", " << h_sums[2] << std::endl;
-#endif
-
-    // ===== STEP 12: Check correctness =====
-    bool attns_correct = true;
-    bool maxs_correct = true;
-    bool sums_correct = true;
-
-    // Absolute diffs
-    float max_attn_abs_diff = 0.0f, avg_attn_abs_diff = 0.0f;
-    float max_maxs_abs_diff = 0.0f, avg_maxs_abs_diff = 0.0f;
-    float max_sums_abs_diff = 0.0f, avg_sums_abs_diff = 0.0f;
-
-    // Relative diffs
-    float max_attn_rel_diff = 0.0f, avg_attn_rel_diff = 0.0f;
-    float max_maxs_rel_diff = 0.0f, avg_maxs_rel_diff = 0.0f;
-    float max_sums_rel_diff = 0.0f, avg_sums_rel_diff = 0.0f;
-
-    int attn_nan_count = 0, maxs_nan_count = 0, sums_nan_count = 0;
-    int attn_count = 0, maxs_count = 0, sums_count = 0;
-
-    for(int chunk = 0; chunk < N_CHUNKS; chunk++) {
-        int offset = h_offsets[chunk];
-
-        // Check attention outputs
-        for(int i = 0; i < OUT_CHUNK_SIZE; i++) {
-            int idx = offset * N_HEADS * D_HEAD + i;
-            float actual = h_attns[idx];
-            float expected = h_out_ref[chunk][i];
-            float abs_diff = std::abs(actual - expected);
-            // Use max(|expected|, 1.0) as denominator to avoid inflated relative errors for near-zero values
-            float rel_diff = abs_diff / std::max(std::abs(expected), 1.0f);
-
-            if (std::isnan(actual) || std::isinf(actual)) {
-                attn_nan_count++;
-                attns_correct = false;
-            } else {
-                avg_attn_abs_diff += abs_diff;
-                avg_attn_rel_diff += rel_diff;
-                max_attn_abs_diff = std::max(max_attn_abs_diff, abs_diff);
-                max_attn_rel_diff = std::max(max_attn_rel_diff, rel_diff);
-                attn_count++;
-
-                // Use relative tolerance for larger values (bf16 precision ~0.5%)
-                float rel_tol = std::max(0.1f, std::abs(expected) * 0.01f);
-                if(abs_diff > rel_tol) {
-                    attns_correct = false;
-                }
-            }
-        }
-
-        // Check max/sum outputs
-        for(int i = 0; i < MAX_SUM_CHUNK_SIZE; i++) {
-            int idx = offset * N_HEADS + i;
-
-            float maxs_abs_diff = std::abs(h_maxs[idx] - h_maxs_ref[chunk][i]);
-            float sums_abs_diff = std::abs(h_sums[idx] - h_sums_ref[chunk][i]);
-            // Use max(|expected|, 1.0) as denominator to avoid inflated relative errors for near-zero values
-            float maxs_rel_diff = maxs_abs_diff / std::max(std::abs(h_maxs_ref[chunk][i]), 1.0f);
-            float sums_rel_diff = sums_abs_diff / std::max(std::abs(h_sums_ref[chunk][i]), 1.0f);
-
-            if (std::isnan(h_maxs[idx])) maxs_nan_count++;
-            if (std::isnan(h_sums[idx])) sums_nan_count++;
-
-            avg_maxs_abs_diff += maxs_abs_diff;
-            avg_sums_abs_diff += sums_abs_diff;
-            avg_maxs_rel_diff += maxs_rel_diff;
-            avg_sums_rel_diff += sums_rel_diff;
-            max_maxs_abs_diff = std::max(max_maxs_abs_diff, maxs_abs_diff);
-            max_sums_abs_diff = std::max(max_sums_abs_diff, sums_abs_diff);
-            max_maxs_rel_diff = std::max(max_maxs_rel_diff, maxs_rel_diff);
-            max_sums_rel_diff = std::max(max_sums_rel_diff, sums_rel_diff);
-            maxs_count++;
-            sums_count++;
-
-            // Use relative tolerance (1% of expected value, min 0.1)
-            float maxs_tol = std::max(0.1f, std::abs(h_maxs_ref[chunk][i]) * 0.01f);
-            float sums_tol = std::max(0.1f, std::abs(h_sums_ref[chunk][i]) * 0.01f);
-
-            if(maxs_abs_diff > maxs_tol || std::isnan(maxs_abs_diff)) {
-                maxs_correct = false;
-            }
-            if(sums_abs_diff > sums_tol || std::isnan(sums_abs_diff)) {
-                sums_correct = false;
-            }
-        }
+    // Cleanup
+    delete[] h_q;
+    for (int i = 0; i < N_CHUNKS; i++) {
+        delete[] h_k[i]; delete[] h_v[i];
+        delete[] h_out_ref[i]; delete[] h_maxs_ref[i]; delete[] h_sums_ref[i];
     }
-
-    // Compute averages
-    if (attn_count > 0) { avg_attn_abs_diff /= attn_count; avg_attn_rel_diff /= attn_count; }
-    if (maxs_count > 0) { avg_maxs_abs_diff /= maxs_count; avg_maxs_rel_diff /= maxs_count; }
-    if (sums_count > 0) { avg_sums_abs_diff /= sums_count; avg_sums_rel_diff /= sums_count; }
-
-    std::cout << "\n=== Correctness Results ===" << std::endl;
-    std::cout << "Attention outputs: " << (attns_correct ? "PASS ✓" : "FAIL ✗") << std::endl;
-    std::cout << "  Absolute: max=" << max_attn_abs_diff << ", avg=" << avg_attn_abs_diff << std::endl;
-    std::cout << "  Relative: max=" << (max_attn_rel_diff * 100) << "%, avg=" << (avg_attn_rel_diff * 100) << "%" << std::endl;
-    if (attn_nan_count > 0) std::cout << "  NaN/Inf count: " << attn_nan_count << std::endl;
-
-    std::cout << "Max values: " << (maxs_correct ? "PASS ✓" : "FAIL ✗") << std::endl;
-    std::cout << "  Absolute: max=" << max_maxs_abs_diff << ", avg=" << avg_maxs_abs_diff << std::endl;
-    std::cout << "  Relative: max=" << (max_maxs_rel_diff * 100) << "%, avg=" << (avg_maxs_rel_diff * 100) << "%" << std::endl;
-    if (maxs_nan_count > 0) std::cout << "  NaN count: " << maxs_nan_count << std::endl;
-
-    std::cout << "Sum values: " << (sums_correct ? "PASS ✓" : "FAIL ✗") << std::endl;
-    std::cout << "  Absolute: max=" << max_sums_abs_diff << ", avg=" << avg_sums_abs_diff << std::endl;
-    std::cout << "  Relative: max=" << (max_sums_rel_diff * 100) << "%, avg=" << (avg_sums_rel_diff * 100) << "%" << std::endl;
-    if (sums_nan_count > 0) std::cout << "  NaN count: " << sums_nan_count << std::endl;
-
-    if(attns_correct && maxs_correct && sums_correct) {
-        std::cout << "\n✓ All tests PASSED!" << std::endl;
-    } else {
-        std::cout << "\n✗ Some tests FAILED" << std::endl;
-
-#if HARNESS_DEBUG
-        // Print first few mismatches for debugging
-        std::cout << "\nFirst few mismatches:" << std::endl;
-        int shown = 0;
-        for(int chunk = 0; chunk < N_CHUNKS && shown < 5; chunk++) {
-            int offset = h_offsets[chunk];
-            for(int i = 0; i < MAX_SUM_CHUNK_SIZE && shown < 5; i++) {
-                int idx = offset * N_HEADS + i;
-                if (std::abs(h_maxs[idx] - h_maxs_ref[chunk][i]) > 0.1f) {
-                    std::cout << "  maxs[chunk=" << chunk << ", i=" << i << "]: "
-                              << "got=" << h_maxs[idx] << ", expected=" << h_maxs_ref[chunk][i] << std::endl;
-                    shown++;
-                }
-            }
-        }
-#endif
-    }
-
-    // ===== Cleanup =====
-    delete[] h_q_float;
-    for(int i = 0; i < N_CHUNKS; i++) {
-        delete[] h_k_float[i];
-        delete[] h_v_float[i];
-        delete[] h_out_ref[i];
-        delete[] h_maxs_ref[i];
-        delete[] h_sums_ref[i];
-    }
-    delete[] h_attns;
-    delete[] h_maxs;
-    delete[] h_sums;
+    delete[] h_attns; delete[] h_maxs; delete[] h_sums;
 
     cudaFree(d_q);
-    for(int i = 0; i < N_CHUNKS; i++) {
-        cudaFree(d_k[i]);
-        cudaFree(d_v[i]);
-    }
-    cudaFree(d_attns);
-    cudaFree(d_maxs);
-    cudaFree(d_sums);
-    cudaFree(d_keys_ptrs);
-    cudaFree(d_values_ptrs);
-    cudaFree(d_offsets);
-    cudaFree(d_begins);
-    cudaFree(d_ends);
+    for (int i = 0; i < N_CHUNKS; i++) { cudaFree(d_k[i]); cudaFree(d_v[i]); }
+    cudaFree(d_attns); cudaFree(d_maxs); cudaFree(d_sums);
+    cudaFree(d_keys_ptrs); cudaFree(d_values_ptrs);
+    cudaFree(d_offsets); cudaFree(d_begins); cudaFree(d_ends);
 
-    return attns_correct && maxs_correct && sums_correct ? 0 : 1;
+    return result.passed ? 0 : 1;
 }
