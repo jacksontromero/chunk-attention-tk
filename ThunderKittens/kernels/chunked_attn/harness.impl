@@ -357,11 +357,19 @@ int main(int argc, char **argv) {
     bool attns_correct = true;
     bool maxs_correct = true;
     bool sums_correct = true;
-    float max_attn_diff = 0.0f;
-    float max_maxs_diff = 0.0f;
-    float max_sums_diff = 0.0f;
-    float avg_attn_diff = 0.0f;
+
+    // Absolute diffs
+    float max_attn_abs_diff = 0.0f, avg_attn_abs_diff = 0.0f;
+    float max_maxs_abs_diff = 0.0f, avg_maxs_abs_diff = 0.0f;
+    float max_sums_abs_diff = 0.0f, avg_sums_abs_diff = 0.0f;
+
+    // Relative diffs
+    float max_attn_rel_diff = 0.0f, avg_attn_rel_diff = 0.0f;
+    float max_maxs_rel_diff = 0.0f, avg_maxs_rel_diff = 0.0f;
+    float max_sums_rel_diff = 0.0f, avg_sums_rel_diff = 0.0f;
+
     int attn_nan_count = 0, maxs_nan_count = 0, sums_nan_count = 0;
+    int attn_count = 0, maxs_count = 0, sums_count = 0;
 
     for(int chunk = 0; chunk < N_CHUNKS; chunk++) {
         int offset = h_offsets[chunk];
@@ -371,15 +379,23 @@ int main(int argc, char **argv) {
             int idx = offset * N_HEADS * D_HEAD + i;
             float actual = h_attns[idx];
             float expected = h_out_ref[chunk][i];
-            float diff = std::abs(actual - expected);
+            float abs_diff = std::abs(actual - expected);
+            // Use max(|expected|, 1.0) as denominator to avoid inflated relative errors for near-zero values
+            float rel_diff = abs_diff / std::max(std::abs(expected), 1.0f);
 
             if (std::isnan(actual) || std::isinf(actual)) {
                 attn_nan_count++;
                 attns_correct = false;
             } else {
-                avg_attn_diff += diff;
-                max_attn_diff = std::max(max_attn_diff, diff);
-                if(diff > 0.1f) {
+                avg_attn_abs_diff += abs_diff;
+                avg_attn_rel_diff += rel_diff;
+                max_attn_abs_diff = std::max(max_attn_abs_diff, abs_diff);
+                max_attn_rel_diff = std::max(max_attn_rel_diff, rel_diff);
+                attn_count++;
+
+                // Use relative tolerance for larger values (bf16 precision ~0.5%)
+                float rel_tol = std::max(0.1f, std::abs(expected) * 0.01f);
+                if(abs_diff > rel_tol) {
                     attns_correct = false;
                 }
             }
@@ -389,37 +405,58 @@ int main(int argc, char **argv) {
         for(int i = 0; i < MAX_SUM_CHUNK_SIZE; i++) {
             int idx = offset * N_HEADS + i;
 
-            float maxs_diff = std::abs(h_maxs[idx] - h_maxs_ref[chunk][i]);
-            float sums_diff = std::abs(h_sums[idx] - h_sums_ref[chunk][i]);
+            float maxs_abs_diff = std::abs(h_maxs[idx] - h_maxs_ref[chunk][i]);
+            float sums_abs_diff = std::abs(h_sums[idx] - h_sums_ref[chunk][i]);
+            // Use max(|expected|, 1.0) as denominator to avoid inflated relative errors for near-zero values
+            float maxs_rel_diff = maxs_abs_diff / std::max(std::abs(h_maxs_ref[chunk][i]), 1.0f);
+            float sums_rel_diff = sums_abs_diff / std::max(std::abs(h_sums_ref[chunk][i]), 1.0f);
 
             if (std::isnan(h_maxs[idx])) maxs_nan_count++;
             if (std::isnan(h_sums[idx])) sums_nan_count++;
 
-            max_maxs_diff = std::max(max_maxs_diff, maxs_diff);
-            max_sums_diff = std::max(max_sums_diff, sums_diff);
+            avg_maxs_abs_diff += maxs_abs_diff;
+            avg_sums_abs_diff += sums_abs_diff;
+            avg_maxs_rel_diff += maxs_rel_diff;
+            avg_sums_rel_diff += sums_rel_diff;
+            max_maxs_abs_diff = std::max(max_maxs_abs_diff, maxs_abs_diff);
+            max_sums_abs_diff = std::max(max_sums_abs_diff, sums_abs_diff);
+            max_maxs_rel_diff = std::max(max_maxs_rel_diff, maxs_rel_diff);
+            max_sums_rel_diff = std::max(max_sums_rel_diff, sums_rel_diff);
+            maxs_count++;
+            sums_count++;
 
-            if(maxs_diff > 0.1f || std::isnan(maxs_diff)) {
+            // Use relative tolerance (1% of expected value, min 0.1)
+            float maxs_tol = std::max(0.1f, std::abs(h_maxs_ref[chunk][i]) * 0.01f);
+            float sums_tol = std::max(0.1f, std::abs(h_sums_ref[chunk][i]) * 0.01f);
+
+            if(maxs_abs_diff > maxs_tol || std::isnan(maxs_abs_diff)) {
                 maxs_correct = false;
             }
-            if(sums_diff > 0.1f || std::isnan(sums_diff)) {
+            if(sums_abs_diff > sums_tol || std::isnan(sums_abs_diff)) {
                 sums_correct = false;
             }
         }
     }
 
-    avg_attn_diff /= (N_CHUNKS * OUT_CHUNK_SIZE);
+    // Compute averages
+    if (attn_count > 0) { avg_attn_abs_diff /= attn_count; avg_attn_rel_diff /= attn_count; }
+    if (maxs_count > 0) { avg_maxs_abs_diff /= maxs_count; avg_maxs_rel_diff /= maxs_count; }
+    if (sums_count > 0) { avg_sums_abs_diff /= sums_count; avg_sums_rel_diff /= sums_count; }
 
     std::cout << "\n=== Correctness Results ===" << std::endl;
     std::cout << "Attention outputs: " << (attns_correct ? "PASS ✓" : "FAIL ✗") << std::endl;
-    std::cout << "  Max diff: " << max_attn_diff << ", Avg diff: " << avg_attn_diff << std::endl;
+    std::cout << "  Absolute: max=" << max_attn_abs_diff << ", avg=" << avg_attn_abs_diff << std::endl;
+    std::cout << "  Relative: max=" << (max_attn_rel_diff * 100) << "%, avg=" << (avg_attn_rel_diff * 100) << "%" << std::endl;
     if (attn_nan_count > 0) std::cout << "  NaN/Inf count: " << attn_nan_count << std::endl;
 
     std::cout << "Max values: " << (maxs_correct ? "PASS ✓" : "FAIL ✗") << std::endl;
-    std::cout << "  Max diff: " << max_maxs_diff << std::endl;
+    std::cout << "  Absolute: max=" << max_maxs_abs_diff << ", avg=" << avg_maxs_abs_diff << std::endl;
+    std::cout << "  Relative: max=" << (max_maxs_rel_diff * 100) << "%, avg=" << (avg_maxs_rel_diff * 100) << "%" << std::endl;
     if (maxs_nan_count > 0) std::cout << "  NaN count: " << maxs_nan_count << std::endl;
 
     std::cout << "Sum values: " << (sums_correct ? "PASS ✓" : "FAIL ✗") << std::endl;
-    std::cout << "  Max diff: " << max_sums_diff << std::endl;
+    std::cout << "  Absolute: max=" << max_sums_abs_diff << ", avg=" << avg_sums_abs_diff << std::endl;
+    std::cout << "  Relative: max=" << (max_sums_rel_diff * 100) << "%, avg=" << (avg_sums_rel_diff * 100) << "%" << std::endl;
     if (sums_nan_count > 0) std::cout << "  NaN count: " << sums_nan_count << std::endl;
 
     if(attns_correct && maxs_correct && sums_correct) {
