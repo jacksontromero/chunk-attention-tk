@@ -16,10 +16,12 @@
  * Differences from original:
  *   - Uses bf16 instead of half (similar precision, better HW support)
  *   - Uses TK's warp:: MMA operations instead of WMMA
+ *   - Uses TK primitives for softmax (row_max, sub_row, exp, row_sum)
  *   - Row-parallel: 2 warps each handle half the query rows
  */
 
 #include "kittens.cuh"
+#include "../../include/kittens.cuh"
 using namespace kittens;
 
 // Configuration: 2 warps for row parallelism (TK tiles require rows ≥ 16)
@@ -59,8 +61,8 @@ attn_chunk_first_tk(const __grid_constant__ attn_chunk_first_globals<max_n_seqs,
     // Thread indexing
     const int head = blockIdx.x;
     const int chunk = blockIdx.y;
-    const int warp = threadIdx.x / 32;
-    const int lane = threadIdx.x % 32;
+    const int warp = kittens::warpid();
+    const int lane = kittens::laneid();
     const int my_row_start = warp * ROWS_PER_WARP;
 
     // Get sequence range for this chunk
@@ -75,16 +77,17 @@ attn_chunk_first_tk(const __grid_constant__ attn_chunk_first_globals<max_n_seqs,
     extern __shared__ alignment_dummy __shm[];
     shared_allocator al((int*)&__shm[0]);
 
-    // K, V shared by all warps; Q, scores, output per-warp
+    // K, V shared by all warps; Q, output per-warp; max/sum vectors for global store
     st<bf16, chunk_size, d_head> &K_s = al.allocate<st<bf16, chunk_size, d_head>>();
     st<bf16, chunk_size, d_head> &V_s = al.allocate<st<bf16, chunk_size, d_head>>();
     auto &Q_s = al.allocate<st<bf16, ROWS_PER_WARP, d_head>, NUM_WARPS>()[warp];
-    auto &scores_s = al.allocate<st<float, ROWS_PER_WARP, chunk_size>, NUM_WARPS>()[warp];
     auto &out_s = al.allocate<st<float, ROWS_PER_WARP, d_head>, NUM_WARPS>()[warp];
+    // Shared vectors for transferring max/sum from registers to global memory
+    auto &max_sv = al.allocate<sv<float, ROWS_PER_WARP>, NUM_WARPS>()[warp];
+    auto &sum_sv = al.allocate<sv<float, ROWS_PER_WARP>, NUM_WARPS>()[warp];
 
     // =========================================================================
     // Load K, V (cooperative across all threads)
-    // Original: loaded via matrix_multiply_gAB_sC's internal tiling
     // =========================================================================
     const bf16* K_ptr = reinterpret_cast<const bf16*>(g.keys[chunk]) + head * chunk_size * d_head;
     const bf16* V_ptr = reinterpret_cast<const bf16*>(g.values[chunk]) + head * chunk_size * d_head;
@@ -96,7 +99,6 @@ attn_chunk_first_tk(const __grid_constant__ attn_chunk_first_globals<max_n_seqs,
 
     // =========================================================================
     // Load Q (each warp loads its rows)
-    // Original: Q layout is [n_seqs, n_heads, d_head], accessed as q + seq*n_heads*d_head + head*d_head
     // =========================================================================
     const bf16* Q_base = g.Q + seq_begin * g.n_heads * d_head + head * d_head;
 
@@ -111,7 +113,6 @@ attn_chunk_first_tk(const __grid_constant__ attn_chunk_first_globals<max_n_seqs,
 
     // =========================================================================
     // Compute scores = Q @ K^T * scale
-    // Original: matrix_multiply_gAB_sC then warp_vector_scale
     // =========================================================================
     rt<bf16, ROWS_PER_WARP, d_head> Q_r;
     rt<bf16, chunk_size, d_head> K_r;
@@ -122,13 +123,31 @@ attn_chunk_first_tk(const __grid_constant__ attn_chunk_first_globals<max_n_seqs,
     warp::zero(scores_r);
     warp::mma_ABt(scores_r, Q_r, K_r, scores_r);
     warp::mul(scores_r, scores_r, g.scale);
-    warp::store(scores_s, scores_r);
-    __syncwarp();
 
     // =========================================================================
-    // Softmax: compute max, exp, sum per row
-    // Original: warp_vector_max, warp_cal_exp, warp_vector_sum
+    // Softmax: compute max, exp, sum per row using TK primitives
     // =========================================================================
+
+    // Row max: max_vec[r] = max(scores_r[r, :])
+    col_vec<decltype(scores_r)> max_vec;
+    warp::row_max(max_vec, scores_r);
+
+    // Subtract max from each row for numerical stability: scores_r[r, c] -= max_vec[r]
+    warp::sub_row(scores_r, scores_r, max_vec);
+
+    // Exponentiate in-place: scores_r[r, c] = exp(scores_r[r, c])
+    warp::exp(scores_r, scores_r);
+
+    // Row sum: sum_vec[r] = sum(scores_r[r, :])
+    col_vec<decltype(scores_r)> sum_vec;
+    warp::zero(sum_vec);
+    warp::row_sum(sum_vec, scores_r, sum_vec);
+
+    // Store max and sum to shared vectors, then copy to global memory
+    warp::store(max_sv, max_vec);
+    warp::store(sum_sv, sum_vec);
+    __syncwarp();
+
     const int result_offset = g.offsets[chunk];
     const int out_base = result_offset * g.n_heads + head * n;
     float* maxs_out = g.maxs.raw_ptr + out_base;
@@ -136,37 +155,22 @@ attn_chunk_first_tk(const __grid_constant__ attn_chunk_first_globals<max_n_seqs,
 
     for (int r = lane; r < ROWS_PER_WARP; r += 32) {
         int global_row = my_row_start + r;
-        if (global_row >= n) continue;
-
-        // Row max
-        float max_val = -INFINITY;
-        for (int c = 0; c < chunk_size; c++)
-            max_val = fmaxf(max_val, scores_s[{r, c}]);
-        maxs_out[global_row] = max_val;
-
-        // Exp and sum
-        float sum_val = 0.0f;
-        for (int c = 0; c < chunk_size; c++) {
-            float v = expf(scores_s[{r, c}] - max_val);
-            scores_s[{r, c}] = v;
-            sum_val += v;
+        if (global_row < n) {
+            maxs_out[global_row] = max_sv[r];
+            sums_out[global_row] = sum_sv[r];
         }
-        sums_out[global_row] = sum_val;
     }
-    __syncwarp();
 
     // =========================================================================
     // Compute output = exp_scores @ V
-    // Original: matrix_multiply_sA_gBC
+    // Note: scores_r already contains exp values from softmax above
     // =========================================================================
     rt<bf16, chunk_size, d_head, ducks::rt_layout::col> V_r;
     warp::load(V_r, V_s);
 
-    rt<float, ROWS_PER_WARP, chunk_size> exp_scores_r;
-    warp::load(exp_scores_r, scores_s);
-
+    // Convert exp_scores from f32 to bf16 for MMA
     rt<bf16, ROWS_PER_WARP, chunk_size> exp_scores_bf16;
-    exp_scores_bf16 = exp_scores_r;
+    exp_scores_bf16 = scores_r;
 
     rt<float, ROWS_PER_WARP, d_head> out_r;
     warp::zero(out_r);
@@ -176,7 +180,6 @@ attn_chunk_first_tk(const __grid_constant__ attn_chunk_first_globals<max_n_seqs,
 
     // =========================================================================
     // Store output
-    // Original: direct copy or via shared_output for partial chunks
     // =========================================================================
     float* attns_out = g.attns.raw_ptr + out_base * d_head;
 
