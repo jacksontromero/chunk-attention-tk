@@ -220,13 +220,9 @@ attn_seq_first_tk(const __grid_constant__ attn_seq_first_globals<chunk_size, d_h
     if (warp == 0) {
         for(int d = lane; d < d_head; d += 32) {
             float sum = 0.0f;
-            float c = 0.0f; // Kahan compensation
             #pragma unroll
             for(int w = 0; w < NUM_WARPS; w++) {
-                float y = all_out_sv[w][d] * warp_scale[w] - c;
-                float t = sum + y;
-                c = (t - sum) - y;
-                sum = t;
+                sum += all_out_sv[w][d] * warp_scale[w];
             }
             float val = sum * inv_sum_s;
             // Write directly to global memory to avoid shared memory intermediate issues

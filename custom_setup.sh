@@ -91,9 +91,9 @@ echo "  unset CC CXX LD"
 echo "  cmake -S . -B build -DTORCH=\$CONDA_PREFIX/lib/python3.10/site-packages/torch/ -DUSE_CUDA=ON ..."
 
 echo "ThunderKittens env setup"
-export CUDAHOSTCXX=/usr/bin/g++-11
-export CC=/usr/bin/gcc-11
-export CXX=/usr/bin/g++-11
+export CUDAHOSTCXX=/usr/bin/g++-13
+export CC=/usr/bin/gcc-13
+export CXX=/usr/bin/g++-13
 
 export CUDA_HOME=${CONDA_PREFIX}
 export PATH=${CUDA_HOME}/bin:${PATH}
