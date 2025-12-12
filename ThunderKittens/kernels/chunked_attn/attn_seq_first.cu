@@ -126,22 +126,11 @@ attn_seq_first_tk(const __grid_constant__ attn_seq_first_globals<chunk_size, d_h
         const bf16* V_ptr = reinterpret_cast<const bf16*>(g.values[chunk_idx]) + kv_row_offset;
 
         // Manual load K into KV_s (per warp)
-        bf16* kv_dst = (bf16*)&KV_s;
         for(int j = lane; j < chunk_size * d_head; j += 32) {
-            kv_dst[j] = K_ptr[j];
+            // kv_dst[j] = K_ptr[j]; // Linear write is WRONG for swizzled st
+            KV_s[{j / d_head, j % d_head}] = K_ptr[j];
         }
-        __syncwarp(); // Ensure load complete before use? 
-        // No, warp::load in TK usually implies syncwarp if needed, but here we are in warp scope.
-        // The instructions are issued in order. Registers are dependent.
-        // But loading to shared memory... `warp::load(K_r, KV_s)` reads shared.
-        // We need `__syncwarp()` (or `__threadfence_block` if cross-warp, but this is intra-warp).
-        // `__syncwarp()` is safer. Or assume `volatile` shared memory behavior.
-        // In TK, `load` usually has `__syncwarp()` if it matters? 
-        // Actually, `ld.shared` after `st.shared` needs dependency.
-        // `K_r` load is `ld.shared`. Loop is `st.shared`.
-        // A barrier is theoretically needed if we want to ensure visibility? 
-        // Within a warp, simple memory dependency handles it?
-        // Volta+ has independent thread scheduling. `__syncwarp()` is GOOD practice.
+        __syncwarp(); 
         
         kv_tile_t K_r;
         warp::load(K_r, KV_s);
@@ -178,7 +167,7 @@ attn_seq_first_tk(const __grid_constant__ attn_seq_first_globals<chunk_size, d_h
 
         // Manual load V
         for(int j = lane; j < chunk_size * d_head; j += 32) {
-            kv_dst[j] = V_ptr[j];
+            KV_s[{j / d_head, j % d_head}] = V_ptr[j];
         }
         __syncwarp(); 
 
@@ -231,9 +220,13 @@ attn_seq_first_tk(const __grid_constant__ attn_seq_first_globals<chunk_size, d_h
     if (warp == 0) {
         for(int d = lane; d < d_head; d += 32) {
             float sum = 0.0f;
+            float c = 0.0f; // Kahan compensation
             #pragma unroll
             for(int w = 0; w < NUM_WARPS; w++) {
-                sum += all_out_sv[w][d] * warp_scale[w];
+                float y = all_out_sv[w][d] * warp_scale[w] - c;
+                float t = sum + y;
+                c = (t - sum) - y;
+                sum = t;
             }
             float val = sum * inv_sum_s;
             // Write directly to global memory to avoid shared memory intermediate issues
