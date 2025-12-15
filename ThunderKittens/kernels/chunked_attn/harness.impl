@@ -16,11 +16,10 @@
 // ============================================================================
 // Configuration (must match kernel)
 // ============================================================================
-constexpr int MAX_N_SEQS = 32;
+constexpr int MAX_N_SEQS = 64;  // 64 rows for full warpgroup utilization (64/4 = 16 rows per warp)
 constexpr int CHUNK_SIZE = 64;
 constexpr int D_HEAD = 128;
-constexpr int BLOCK_THREADS = 64;  // 2 warps × 32
-constexpr int ROWS_PER_WARP = 16;  // MAX_N_SEQS / 2
+constexpr int BLOCK_THREADS = 128;  // 4 warps × 32 = 128 threads = 1 warpgroup
 
 // ============================================================================
 // Utilities
@@ -271,11 +270,13 @@ int main(int argc, char** argv) {
         .n_heads = cfg.n_heads
     };
 
-    // Compute shared memory size
-    size_t smem = sizeof(st<bf16, CHUNK_SIZE, D_HEAD>) * 2 +      // K, V shared
-                  sizeof(st<bf16, ROWS_PER_WARP, D_HEAD>) * 2 +   // Q per-warp
-                  sizeof(st<float, ROWS_PER_WARP, CHUNK_SIZE>) * 2 + // scores per-warp
-                  sizeof(st<float, ROWS_PER_WARP, D_HEAD>) * 2;   // output per-warp
+    // Compute shared memory size (4 warps, each handling 16 rows)
+    constexpr int NUM_WARPS = 4;
+    constexpr int ROWS_PER_WARP = MAX_N_SEQS / NUM_WARPS;
+    size_t smem = sizeof(st<bf16, CHUNK_SIZE, D_HEAD>) * 2 +              // K, V shared
+                  sizeof(st<bf16, ROWS_PER_WARP, D_HEAD>) * NUM_WARPS +   // Q per-warp
+                  sizeof(st<float, ROWS_PER_WARP, D_HEAD>) * NUM_WARPS +  // output per-warp
+                  sizeof(sv<float, ROWS_PER_WARP>) * NUM_WARPS * 2;       // max/sum vectors per-warp
     smem = ((smem + 4095) / 4096) * 4096;
 
     cudaFuncSetAttribute(attn_chunk_first_tk<MAX_N_SEQS, CHUNK_SIZE, D_HEAD>,
