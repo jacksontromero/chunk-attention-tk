@@ -37,6 +37,21 @@ void to_bf16(const float* src, bf16* dst, int n) {
     for (int i = 0; i < n; i++) dst[i] = __float2bfloat16(src[i]);
 }
 
+// Transpose Q from [n_seqs, n_heads, d_head] to [n_heads, n_seqs, d_head] for TMA
+void transpose_q_for_tma(const float* src, bf16* dst, int n_seqs, int n_heads, int d_head) {
+    for (int h = 0; h < n_heads; h++) {
+        for (int s = 0; s < n_seqs; s++) {
+            for (int d = 0; d < d_head; d++) {
+                // src index: [s, h, d] = s * n_heads * d_head + h * d_head + d
+                // dst index: [h, s, d] = h * n_seqs * d_head + s * d_head + d
+                int src_idx = s * n_heads * d_head + h * d_head + d;
+                int dst_idx = h * n_seqs * d_head + s * d_head + d;
+                dst[dst_idx] = __float2bfloat16(src[src_idx]);
+            }
+        }
+    }
+}
+
 // ============================================================================
 // Test verification
 // ============================================================================
@@ -222,7 +237,8 @@ int main(int argc, char** argv) {
 
     // Convert to bf16 and copy
     std::vector<bf16> tmp(std::max(q_size, kv_size));
-    to_bf16(h_q.data(), tmp.data(), q_size);
+    // to_bf16(h_q.data(), tmp.data(), q_size); -- OLD: flat copy
+    transpose_q_for_tma(h_q.data(), tmp.data(), cfg.n_seqs, cfg.n_heads, cfg.d_head); // NEW: transpose for TMA [1, H, N, D]
     cudaMemcpy(d_q, tmp.data(), q_size * sizeof(bf16), cudaMemcpyHostToDevice);
 
     for (int c = 0; c < cfg.n_chunks; c++) {
@@ -263,7 +279,7 @@ int main(int argc, char** argv) {
         .offsets = gl<int, -1, -1, -1, -1>(d_offsets, 1, 1, 1, cfg.n_chunks),
         .begins = gl<int, -1, -1, -1, -1>(d_begins, 1, 1, 1, cfg.n_chunks),
         .ends = gl<int, -1, -1, -1, -1>(d_ends, 1, 1, 1, cfg.n_chunks),
-        .Q = d_q,
+        .Q = make_gl<Globals::Q_gl>((uint64_t)d_q, 1, cfg.n_heads, cfg.n_seqs, D_HEAD),
         .keys = d_keys,
         .values = d_vals,
         .scale = 1.0f / sqrtf(float(cfg.d_head)),
@@ -275,9 +291,10 @@ int main(int argc, char** argv) {
     constexpr int NUM_WARPS = 4;
     constexpr int ROWS_PER_WARP = MAX_N_SEQS / NUM_WARPS;
     size_t smem = sizeof(st<bf16, CHUNK_SIZE, D_HEAD>) +                  // KV shared (reused!)
-                  sizeof(st<bf16, ROWS_PER_WARP, D_HEAD>) * NUM_WARPS +   // Q per-warp
+                  sizeof(st<bf16, MAX_N_SEQS, D_HEAD>) +                  // Q tile (MAX_N_SEQS)
                   sizeof(st<float, ROWS_PER_WARP, D_HEAD>) * NUM_WARPS +  // output per-warp
-                  sizeof(sv<float, ROWS_PER_WARP>) * NUM_WARPS * 2;       // max/sum vectors per-warp
+                  sizeof(sv<float, ROWS_PER_WARP>) * NUM_WARPS * 2 +      // max/sum vectors per-warp
+                  16384;                                                  // Extra padding for safety
     smem = ((smem + 4095) / 4096) * 4096;
 
     cudaFuncSetAttribute(attn_chunk_first_tk<MAX_N_SEQS, CHUNK_SIZE, D_HEAD>,
