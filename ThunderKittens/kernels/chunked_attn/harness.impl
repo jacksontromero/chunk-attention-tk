@@ -271,9 +271,10 @@ int main(int argc, char** argv) {
     };
 
     // Compute shared memory size (4 warps, each handling 16 rows)
+    // NOTE: K and V share the same buffer (reused sequentially)
     constexpr int NUM_WARPS = 4;
     constexpr int ROWS_PER_WARP = MAX_N_SEQS / NUM_WARPS;
-    size_t smem = sizeof(st<bf16, CHUNK_SIZE, D_HEAD>) * 2 +              // K, V shared
+    size_t smem = sizeof(st<bf16, CHUNK_SIZE, D_HEAD>) +                  // KV shared (reused!)
                   sizeof(st<bf16, ROWS_PER_WARP, D_HEAD>) * NUM_WARPS +   // Q per-warp
                   sizeof(st<float, ROWS_PER_WARP, D_HEAD>) * NUM_WARPS +  // output per-warp
                   sizeof(sv<float, ROWS_PER_WARP>) * NUM_WARPS * 2;       // max/sum vectors per-warp

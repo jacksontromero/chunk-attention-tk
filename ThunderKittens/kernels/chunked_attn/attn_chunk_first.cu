@@ -15,7 +15,8 @@
  *
  * Performance optimizations:
  *   - 4 warps for better parallelism (matches original)
- *   - Cooperative loading across all 128 threads
+ *   - Shared memory reuse: K and V share same buffer (40% less smem)
+ *   - Async memory loads (cp.async) to overlap V load with Q@K^T compute
  *   - Warp-level MMA with fp32 accumulation
  *   - Efficient warp-level softmax primitives
  */
@@ -23,6 +24,53 @@
 #include "kittens.cuh"
 #include "../../include/kittens.cuh"
 using namespace kittens;
+
+// ============================================================================
+// Async memory copy helpers (cp.async for H100)
+// ============================================================================
+__device__ __forceinline__ void cp_async_commit() {
+    asm volatile("cp.async.commit_group;\n" ::);
+}
+
+template<int N>
+__device__ __forceinline__ void cp_async_wait() {
+    asm volatile("cp.async.wait_group %0;\n" :: "n"(N));
+}
+
+// 16-byte async copy (8 bf16 elements) using swizzled address
+__device__ __forceinline__ void cp_async_16_swizzled(uint32_t smem_addr, const void* gmem_ptr) {
+    asm volatile(
+        "cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n"
+        :: "r"(smem_addr), "l"(gmem_ptr)
+        : "memory"
+    );
+}
+
+// Async load from raw bf16 pointer into TK shared tile with proper swizzling
+// Uses TK's idx() function to compute swizzled destination addresses
+template<int ROWS, int COLS, int THREADS>
+__device__ __forceinline__ void load_tile_async(st<bf16, ROWS, COLS>& dst, const bf16* src) {
+    constexpr int elem_per_memcpy = 8;  // 16 bytes / 2 bytes per bf16
+    constexpr int memcpy_per_row = COLS / elem_per_memcpy;
+    constexpr int total_elements = ROWS * COLS;
+    constexpr int total_memcpy = total_elements / elem_per_memcpy;
+    constexpr int calls_per_thread = (total_memcpy + THREADS - 1) / THREADS;
+
+    uint32_t dst_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(&dst.data[0]));
+
+    #pragma unroll
+    for (int i = 0; i < calls_per_thread; i++) {
+        int load_idx = i * THREADS + threadIdx.x;
+        if (load_idx < total_memcpy) {
+            int row = load_idx / memcpy_per_row;
+            int col = (load_idx % memcpy_per_row) * elem_per_memcpy;
+
+            // Use TK's idx() for swizzled destination address
+            uint32_t swizzled_addr = dst.idx(dst_ptr, {row, col});
+            cp_async_16_swizzled(swizzled_addr, &src[row * COLS + col]);
+        }
+    }
+}
 
 // Configuration: 4 warps, each handling 16 rows
 constexpr int NUM_WARPS = 4;
@@ -71,14 +119,13 @@ attn_chunk_first_tk(const __grid_constant__ attn_chunk_first_globals<max_n_seqs,
     if (n <= 0 || n > max_n_seqs) return;
 
     // =========================================================================
-    // Shared memory allocation
+    // Shared memory allocation (with K/V reuse for 40% less smem)
     // =========================================================================
     extern __shared__ alignment_dummy __shm[];
     shared_allocator al((int*)&__shm[0]);
 
-    // K, V shared by all warps
-    st<bf16, chunk_size, d_head> &K_s = al.allocate<st<bf16, chunk_size, d_head>>();
-    st<bf16, chunk_size, d_head> &V_s = al.allocate<st<bf16, chunk_size, d_head>>();
+    // KV_s is reused: first for K, then for V (they're never needed simultaneously)
+    st<bf16, chunk_size, d_head> &KV_s = al.allocate<st<bf16, chunk_size, d_head>>();
 
     // Per-warp Q and output tiles
     auto &Q_s = al.allocate<st<bf16, ROWS_PER_WARP, d_head>, NUM_WARPS>()[warp];
@@ -89,14 +136,13 @@ attn_chunk_first_tk(const __grid_constant__ attn_chunk_first_globals<max_n_seqs,
     auto &sum_sv = al.allocate<sv<float, ROWS_PER_WARP>, NUM_WARPS>()[warp];
 
     // =========================================================================
-    // Load K, V cooperatively
+    // Phase 1: Load K into shared memory
     // =========================================================================
     const bf16* K_ptr = reinterpret_cast<const bf16*>(g.keys[chunk]) + head * chunk_size * d_head;
     const bf16* V_ptr = reinterpret_cast<const bf16*>(g.values[chunk]) + head * chunk_size * d_head;
 
     for (int i = threadIdx.x; i < chunk_size * d_head; i += BLOCK_SIZE) {
-        K_s[{i / d_head, i % d_head}] = K_ptr[i];
-        V_s[{i / d_head, i % d_head}] = V_ptr[i];
+        KV_s[{i / d_head, i % d_head}] = K_ptr[i];
     }
 
     // =========================================================================
@@ -114,17 +160,30 @@ attn_chunk_first_tk(const __grid_constant__ attn_chunk_first_globals<max_n_seqs,
     __syncthreads();
 
     // =========================================================================
-    // Warp-level MMA: scores = Q @ K^T
+    // Load K from shared to registers (before we overwrite KV_s with V)
     // =========================================================================
     rt<bf16, ROWS_PER_WARP, d_head> Q_r;
     rt<bf16, chunk_size, d_head> K_r;
     warp::load(Q_r, Q_s);
-    warp::load(K_r, K_s);
+    warp::load(K_r, KV_s);  // K is now in registers
 
+    // =========================================================================
+    // Phase 2: Start async V load while computing Q@K^T (PIPELINED)
+    // =========================================================================
+    load_tile_async<chunk_size, d_head, BLOCK_SIZE>(KV_s, V_ptr);
+    cp_async_commit();  // Commit the async copy group
+
+    // =========================================================================
+    // Warp-level MMA: scores = Q @ K^T (overlapped with V load)
+    // =========================================================================
     rt<float, ROWS_PER_WARP, chunk_size> scores_r;
     warp::zero(scores_r);
     warp::mma_ABt(scores_r, Q_r, K_r, scores_r);
     warp::mul(scores_r, scores_r, g.scale);
+
+    // Wait for V load to complete before we use it
+    cp_async_wait<0>();
+    __syncthreads();
 
     // =========================================================================
     // Warp-level softmax
@@ -160,10 +219,10 @@ attn_chunk_first_tk(const __grid_constant__ attn_chunk_first_globals<max_n_seqs,
     }
 
     // =========================================================================
-    // Warp-level MMA: output = exp_scores @ V
+    // Warp-level MMA: output = exp_scores @ V (V already in KV_s from Phase 2)
     // =========================================================================
     rt<bf16, chunk_size, d_head, ducks::rt_layout::col> V_r;
-    warp::load(V_r, V_s);
+    warp::load(V_r, KV_s);  // Load V from reused KV buffer
 
     rt<bf16, ROWS_PER_WARP, chunk_size> exp_scores_bf16;
     exp_scores_bf16 = scores_r;
