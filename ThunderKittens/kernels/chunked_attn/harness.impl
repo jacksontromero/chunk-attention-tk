@@ -16,10 +16,10 @@
 // ============================================================================
 // Configuration (must match kernel)
 // ============================================================================
-constexpr int MAX_N_SEQS = 64;  // 64 rows for full warpgroup utilization (64/4 = 16 rows per warp)
+constexpr int MAX_N_SEQS = 64;  // 64 rows for full warpgroup utilization
 constexpr int CHUNK_SIZE = 64;
 constexpr int D_HEAD = 128;
-constexpr int BLOCK_THREADS = 128;  // 4 warps × 32 = 128 threads = 1 warpgroup
+constexpr int BLOCK_THREADS = 128;  // 4 warps * 32 = 128 threads = 1 warpgroup
 
 // ============================================================================
 // Utilities

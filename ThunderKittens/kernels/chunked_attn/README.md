@@ -51,7 +51,7 @@ python gentests_seq_first.py --quick    # Generate seq_first tests
 
 | Parameter  | Value | Notes                         |
 | ---------- | ----- | ----------------------------- |
-| MAX_N_SEQS | 32    | Max query rows (compile-time) |
+| MAX_N_SEQS | 64    | Max query rows (compile-time) |
 | CHUNK_SIZE | 64    | K/V chunk size (compile-time) |
 | D_HEAD     | 128   | Head dimension (compile-time) |
 | NUM_WARPS  | 2     | Row-parallel warps per block  |
