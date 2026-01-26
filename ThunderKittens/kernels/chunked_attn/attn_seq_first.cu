@@ -5,52 +5,6 @@ using namespace kittens;
 constexpr int NUM_WARPS = 4;
 constexpr int BLOCK_SIZE = NUM_WARPS * 32;
 
-// ============================================================================
-// Async memory copy helpers (cp.async for H100)
-// ============================================================================
-__device__ __forceinline__ void cp_async_commit() {
-    asm volatile("cp.async.commit_group;\n" ::);
-}
-
-template<int N>
-__device__ __forceinline__ void cp_async_wait() {
-    asm volatile("cp.async.wait_group %0;\n" :: "n"(N));
-}
-
-// 16-byte async copy (8 bf16 elements)
-__device__ __forceinline__ void cp_async_16(uint32_t smem_addr, const void* gmem_ptr) {
-    asm volatile(
-        "cp.async.ca.shared.global.L2::128B [%0], [%1], 16;\n"
-        :: "r"(smem_addr), "l"(gmem_ptr)
-        : "memory"
-    );
-}
-
-// Warp-level async load helper (linear layout)
-template<int ROWS, int COLS>
-__device__ __forceinline__ void load_tile_async_warp_linear(st<bf16, ROWS, COLS>& dst, const bf16* src) {
-    constexpr int elem_per_memcpy = 8;
-    constexpr int memcpy_per_row = COLS / elem_per_memcpy;
-    constexpr int total_elements = ROWS * COLS;
-    constexpr int total_memcpy = total_elements / elem_per_memcpy;
-    constexpr int WARP_SIZE = 32;
-    constexpr int calls_per_thread = (total_memcpy + WARP_SIZE - 1) / WARP_SIZE;
-
-    const int lane = kittens::laneid();
-    uint32_t dst_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(&dst.data[0]));
-
-    #pragma unroll
-    for (int i = 0; i < calls_per_thread; i++) {
-        int load_idx = i * WARP_SIZE + lane;
-        if (load_idx < total_memcpy) {
-            int row = load_idx / memcpy_per_row;
-            int col = (load_idx % memcpy_per_row) * elem_per_memcpy;
-            uint32_t offset = (row * COLS + col) * sizeof(bf16);
-            cp_async_16(dst_ptr + offset, &src[row * COLS + col]);
-        }
-    }
-}
-
 template<int chunk_size, int d_head>
 struct attn_seq_first_globals {
     gl<bf16, -1, -1, -1, -1> output;
@@ -118,71 +72,54 @@ attn_seq_first_tk(const __grid_constant__ attn_seq_first_globals<chunk_size, d_h
     bf16* output_ptr = g.output.raw_ptr + q_row_offset;
     const int* seq_mapping = g.seq_chunk_map + seq_idx * g.seq_chunk_map_stride;
 
-    // ========================================================================
-    // Shared memory allocation using TK's shared_allocator
-    // ========================================================================
     extern __shared__ alignment_dummy __shm[];
     shared_allocator al((int*)&__shm[0]);
 
-    // Q vector in shared memory (TK type)
     sv<bf16, d_head> &Q_sv = al.allocate<sv<bf16, d_head>>();
-
-    // Per-warp output vectors (TK type)
     sv<float, d_head> *all_out_sv = al.allocate<sv<float, d_head>, NUM_WARPS>();
     sv<float, d_head> &out_sv = all_out_sv[warp];
 
-    // Per-warp scores (TK shared vector)
-    sv<float, chunk_size> *all_scores_sv = al.allocate<sv<float, chunk_size>, NUM_WARPS>();
-    sv<float, chunk_size> &scores_sv = all_scores_sv[warp];
+    // KV tiles: [NUM_WARPS] of st
+    st<bf16, chunk_size, d_head> *KV_tiles = al.allocate<st<bf16, chunk_size, d_head>, NUM_WARPS>();
+    st<bf16, chunk_size, d_head> &KV_s = KV_tiles[warp];
 
-    // Per-warp KV tiles (TK type)
-    st<bf16, chunk_size, d_head> *all_KV_st = al.allocate<st<bf16, chunk_size, d_head>, NUM_WARPS>();
-    st<bf16, chunk_size, d_head> &KV_st = all_KV_st[warp];
-
-    // Cross-warp reduction variables
     __shared__ float warp_max[NUM_WARPS];
     __shared__ float warp_sum[NUM_WARPS];
     __shared__ float warp_scale[NUM_WARPS];
     __shared__ float inv_sum_s;
 
-    // ========================================================================
-    // Load Q to shared memory
-    // ========================================================================
+    // Load Q (coalesced, all threads participate)
+    // Q_sv is d_head=128. Block size=128.
     if (threadIdx.x < d_head) {
         Q_sv[threadIdx.x] = q_ptr[threadIdx.x];
     }
 
-    // Initialize output to zero
-    for (int d = lane; d < d_head; d += 32) {
-        out_sv[d] = 0.0f;
-    }
+    // Init output
+    warp::zero(out_sv);
 
+    // Init max/sum
     if (lane == 0) {
         warp_max[warp] = -INFINITY;
         warp_sum[warp] = 0.0f;
     }
     __syncthreads();
 
-    // ========================================================================
-    // TK Register types for softmax ops (16-element vectors)
-    // ========================================================================
-    constexpr int SCORE_CHUNK = 16;
-    using score_rv_t = rv<float, SCORE_CHUNK, ducks::rv_layout::naive>;
-
     float score_max = -INFINITY;
     float score_sum = 0.0f;
 
-    // Each warp processes chunks in round-robin
+    using kv_tile_t = rt<float, chunk_size, d_head>;
+    using q_rv_t = row_vec<kv_tile_t>;
+    using scores_cv_t = col_vec<kv_tile_t>;
+    using out_rv_t = row_vec<kv_tile_t>;
+
     for (int i = warp; i < chunk_num; i += NUM_WARPS) {
         const int chunk_idx = seq_mapping[i];
 
-        // ====================================================================
-        // Path A: Use cached results
-        // ====================================================================
         if (chunk_idx < g.n_shared_chunks) {
-            const int result_offset = g.offsets.raw_ptr[chunk_idx];
-            const int seq_begin = g.begins.raw_ptr[chunk_idx];
-            const int seq_end = g.ends.raw_ptr[chunk_idx];
+             // Path A: Cached
+            const int result_offset = g.offsets[chunk_idx];
+            const int seq_begin = g.begins[chunk_idx];
+            const int seq_end = g.ends[chunk_idx];
             const int max_sum_offset = result_offset * g.n_heads +
                                        head_idx * (seq_end - seq_begin) +
                                        seq_idx - seq_begin;
@@ -204,144 +141,90 @@ attn_seq_first_tk(const __grid_constant__ attn_seq_first_globals<chunk_size, d_h
             score_sum = cached_sum * cached_scale + score_sum * scale_old;
 
             const float* cached_attn = g.attns.raw_ptr + attn_offset;
-            for (int d = lane; d < d_head; d += 32) {
-                out_sv[d] = out_sv[d] * scale_old + cached_attn[d] * cached_scale;
+            for (int j = lane; j < d_head; j += 32) {
+                out_sv[j] = out_sv[j] * scale_old + cached_attn[j] * cached_scale;
             }
             __syncwarp();
             continue;
         }
 
-        // ====================================================================
-        // Path B: Fresh computation using TK primitives
-        // ====================================================================
+        // Path B: Fresh
         const bf16* K_ptr = reinterpret_cast<const bf16*>(g.keys[chunk_idx]) + kv_row_offset;
         const bf16* V_ptr = reinterpret_cast<const bf16*>(g.values[chunk_idx]) + kv_row_offset;
 
-        // Load K asynchronously using TK tile
-        load_tile_async_warp_linear<chunk_size, d_head>(KV_st, K_ptr);
-        cp_async_commit();
-        cp_async_wait<0>();
-        __syncwarp();
-
-        const bf16* K_smem = &KV_st.data[0];
-
-        // ================================================================
-        // Compute Q @ K^T scores using scalar dot products
-        // ================================================================
-        #pragma unroll
-        for (int r = 0; r < chunk_size; r++) {
-            const bf16* K_row = K_smem + r * d_head;
-            float score = compute_dot_product_tk<d_head>(Q_sv, K_row, lane);
-            score = __shfl_sync(0xffffffff, score, 0);
-            score *= g.scale;
-
-            if (i == chunk_num - 1 && last_chunk_unmask_tokens != 0) {
-                if (r >= last_chunk_unmask_tokens) {
-                    score = -INFINITY;
-                }
-            }
-
-            if (lane == 0) {
-                scores_sv[r] = score;
-            }
+        // Manual load K into KV_s (per warp)
+        for(int j = lane; j < chunk_size * d_head; j += 32) {
+            // kv_dst[j] = K_ptr[j]; // Linear write is WRONG for swizzled st
+            KV_s[{j / d_head, j % d_head}] = K_ptr[j];
         }
         __syncwarp();
 
-        // ================================================================
-        // Softmax using TK register vectors
-        // ================================================================
-        float current_chunk_max = -INFINITY;
+        kv_tile_t K_r;
+        warp::load(K_r, KV_s);
 
-        #pragma unroll
-        for (int sc = 0; sc < chunk_size / SCORE_CHUNK; sc++) {
-            score_rv_t scores_rv;
-            #pragma unroll
-            for (int j = 0; j < SCORE_CHUNK; j++) {
-                scores_rv[0][j] = scores_sv[sc * SCORE_CHUNK + j];
-            }
+        q_rv_t Q_rv;
+        warp::load(Q_rv, Q_sv);
 
-            float chunk_max;
-            warp::max(chunk_max, scores_rv);
-            current_chunk_max = fmaxf(current_chunk_max, chunk_max);
+        kv_tile_t QK_tile;
+        warp::broadcast_col(QK_tile, Q_rv);
+        warp::mul(QK_tile, QK_tile, K_r);
+
+        scores_cv_t scores_cv;
+        warp::row_sum(scores_cv, QK_tile);
+        warp::mul(scores_cv, scores_cv, g.scale);
+
+        if (i == chunk_num - 1 && last_chunk_unmask_tokens != 0) {
+            warp::apply(scores_cv, scores_cv,
+                        [last_chunk_unmask_tokens] __device__ (int idx, float v) {
+                            return (idx < last_chunk_unmask_tokens) ? v : -INFINITY;
+                        });
         }
 
-        float new_global_max = fmaxf(score_max, current_chunk_max);
-        float scale_old = __expf(score_max - new_global_max);
-        float scale_new = __expf(current_chunk_max - new_global_max);
-        score_max = new_global_max;
+        float chunk_max;
+        warp::max(chunk_max, scores_cv, score_max);
+        warp::sub(scores_cv, scores_cv, chunk_max);
+        warp::exp(scores_cv, scores_cv);
 
-        for (int d = lane; d < d_head; d += 32) {
-            out_sv[d] = out_sv[d] * scale_old;
-        }
-        __syncwarp();
+        float chunk_sum;
+        warp::sum(chunk_sum, scores_cv);
 
-        float current_chunk_sum = 0.0f;
+        float scale_old = __expf(score_max - chunk_max);
+        score_max = chunk_max;
+        score_sum = score_sum * scale_old + chunk_sum;
 
-        #pragma unroll
-        for (int sc = 0; sc < chunk_size / SCORE_CHUNK; sc++) {
-            score_rv_t scores_rv;
-
-            #pragma unroll
-            for (int j = 0; j < SCORE_CHUNK; j++) {
-                scores_rv[0][j] = scores_sv[sc * SCORE_CHUNK + j];
-            }
-
-            warp::sub(scores_rv, scores_rv, current_chunk_max);
-            warp::exp(scores_rv, scores_rv);
-
-            float chunk_sum;
-            warp::sum(chunk_sum, scores_rv);
-            current_chunk_sum += chunk_sum;
-
-            #pragma unroll
-            for (int j = 0; j < SCORE_CHUNK; j++) {
-                scores_sv[sc * SCORE_CHUNK + j] = scores_rv[0][j];
-            }
+        // Manual load V
+        for(int j = lane; j < chunk_size * d_head; j += 32) {
+            KV_s[{j / d_head, j % d_head}] = V_ptr[j];
         }
         __syncwarp();
 
-        // Load V asynchronously
-        load_tile_async_warp_linear<chunk_size, d_head>(KV_st, V_ptr);
-        cp_async_commit();
-        cp_async_wait<0>();
-        __syncwarp();
+        kv_tile_t V_r;
+        warp::load(V_r, KV_s);
 
-        const bf16* V_smem = &KV_st.data[0];
+        kv_tile_t SV_tile;
+        warp::broadcast_row(SV_tile, scores_cv);
+        warp::mul(SV_tile, SV_tile, V_r);
 
-        // ================================================================
-        // Compute weighted V sum
-        // ================================================================
-        for (int d = lane; d < d_head; d += 32) {
-            float weighted_sum = 0.0f;
+        out_rv_t new_out_rv;
+        warp::col_sum(new_out_rv, SV_tile);
 
-            #pragma unroll
-            for (int r = 0; r < chunk_size; r++) {
-                float exp_score = scores_sv[r];
-                float v_val = __bfloat162float(V_smem[r * d_head + d]);
-                weighted_sum += exp_score * v_val;
-            }
-
-            out_sv[d] = out_sv[d] + weighted_sum * scale_new;
-        }
-        __syncwarp();
-
-        score_sum = score_sum * scale_old + current_chunk_sum * scale_new;
+        out_rv_t out_rv;
+        warp::load(out_rv, out_sv);
+        warp::mul(out_rv, out_rv, scale_old);
+        warp::add(out_rv, out_rv, new_out_rv);
+        warp::store(out_sv, out_rv);
     }
 
-    // Store per-warp results
     if (lane == 0) {
         warp_max[warp] = score_max;
         warp_sum[warp] = score_sum;
     }
     __syncthreads();
 
-    // ========================================================================
-    // Cross-warp reduction using TK register vectors
-    // ========================================================================
+    // Cross-warp reduction (same as before)
     if (warp == 0) {
         rv<float, 32, ducks::rv_layout::naive> max_rv;
         max_rv[0][0] = (lane < NUM_WARPS) ? warp_max[lane] : -INFINITY;
-
         float global_max;
         warp::max(global_max, max_rv);
 
@@ -350,7 +233,6 @@ attn_seq_first_tk(const __grid_constant__ attn_seq_first_globals<chunk_size, d_h
 
         rv<float, 32, ducks::rv_layout::naive> sum_rv;
         sum_rv[0][0] = (lane < NUM_WARPS) ? (warp_sum[lane] * my_scale) : 0.0f;
-
         float total_sum;
         warp::sum(total_sum, sum_rv);
 
@@ -360,15 +242,17 @@ attn_seq_first_tk(const __grid_constant__ attn_seq_first_globals<chunk_size, d_h
     }
     __syncthreads();
 
-    // Final normalization and output
+    // Final normalization
+    // Use manual loop carefully
     if (warp == 0) {
-        for (int d = lane; d < d_head; d += 32) {
+        for(int d = lane; d < d_head; d += 32) {
             float sum = 0.0f;
             #pragma unroll
-            for (int w = 0; w < NUM_WARPS; w++) {
+            for(int w = 0; w < NUM_WARPS; w++) {
                 sum += all_out_sv[w][d] * warp_scale[w];
             }
             float val = sum * inv_sum_s;
+            // Write directly to global memory to avoid shared memory intermediate issues
             output_ptr[d] = __float2bfloat16(val);
         }
     }

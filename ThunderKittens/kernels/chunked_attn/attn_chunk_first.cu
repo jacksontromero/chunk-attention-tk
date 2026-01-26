@@ -250,7 +250,6 @@ attn_chunk_first_tk(const __grid_constant__ attn_chunk_first_globals<max_n_seqs,
 
     rt<float, ROWS_PER_WARP, d_head> out_r;
     warp::zero(out_r);
-
     // warpgroup::mma_AB
     // A: scores [64, 64] (distributed).
     // B: KV_s (V) [64, 128] (shared).

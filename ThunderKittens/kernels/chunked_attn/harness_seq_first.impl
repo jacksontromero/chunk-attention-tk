@@ -3,8 +3,6 @@
  *
  * Reads test data from file, runs kernel, compares against reference.
  * Usage: ./attn_seq_first <test_file.txt> [-v]
- *
- * Test mode: n_shared_chunks = 0, so all chunks go through compute path (PATH B)
  */
 
 #include <iostream>
@@ -15,17 +13,17 @@
 #include <sstream>
 #include <iomanip>
 
-// ============================================================================
+// ============================================================================ 
 // Configuration (must match kernel)
-// ============================================================================
+// ============================================================================ 
 constexpr int CHUNK_SIZE = 64;
 constexpr int D_HEAD = 128;
 constexpr int NUM_WARPS_SF = 4;
 constexpr int BLOCK_THREADS_SF = NUM_WARPS_SF * 32;  // 128 threads
 
-// ============================================================================
+// ============================================================================ 
 // Utilities
-// ============================================================================
+// ============================================================================ 
 #define CUDA_CHECK() do { \
     cudaError_t e = cudaGetLastError(); \
     if (e != cudaSuccess) { \
@@ -39,11 +37,13 @@ void to_bf16(const float* src, bf16* dst, int n) {
     for (int i = 0; i < n; i++) dst[i] = __float2bfloat16(src[i]);
 }
 
-// ============================================================================
+// ============================================================================ 
 // Test verification
-// ============================================================================
+// ============================================================================ 
 struct TestConfig {
     int n_seqs, chunk_size, d_head, n_heads, n_chunks;
+    int seq_tokens;
+    int n_shared_chunks;
 };
 
 struct Stats {
@@ -86,7 +86,7 @@ bool verify(const TestConfig& cfg,
 
                 float act = __bfloat162float(actual_output[idx]);
                 float exp = ref_output[idx];
-                float tol = std::max(0.1f, std::abs(exp) * 0.05f);  // 5% tolerance for bf16
+                float tol = std::max(0.1f, std::abs(exp) * 0.05f);
 
                 int prev_fails = output_stats.fails + output_stats.nans;
                 output_stats.add(act, exp, tol);
@@ -103,7 +103,6 @@ bool verify(const TestConfig& cfg,
 
     bool all_pass = output_stats.pass();
 
-    // Print results
     if (verbose || !all_pass) {
         std::cout << "\n=== Results ===\n";
         std::cout << "Output: " << (output_stats.pass() ? "PASS" : "FAIL")
@@ -116,7 +115,6 @@ bool verify(const TestConfig& cfg,
 
     std::cout << (all_pass ? "PASSED" : "FAILED") << "\n";
 
-    // Summary line for test runner
     int total_fails = output_stats.fails + output_stats.nans;
     float fail_rate = 100.0f * total_fails / output_stats.total;
     std::cout << "SUMMARY: fails=" << total_fails << "/" << output_stats.total
@@ -126,9 +124,9 @@ bool verify(const TestConfig& cfg,
     return all_pass;
 }
 
-// ============================================================================
+// ============================================================================ 
 // Main
-// ============================================================================
+// ============================================================================ 
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::cerr << "Usage: " << argv[0] << " <test.txt> [-v]\n";
@@ -142,7 +140,23 @@ int main(int argc, char** argv) {
     if (!f) { std::cerr << "Cannot open " << argv[1] << "\n"; return 1; }
 
     TestConfig cfg;
-    f >> cfg.n_seqs >> cfg.chunk_size >> cfg.d_head >> cfg.n_heads >> cfg.n_chunks;
+
+    std::string first_line;
+    std::getline(f, first_line);
+    std::istringstream iss(first_line);
+    
+    // Header: n_seqs chunk_size d_head n_heads n_chunks [seq_tokens] [n_shared_chunks]
+    iss >> cfg.n_seqs >> cfg.chunk_size >> cfg.d_head >> cfg.n_heads >> cfg.n_chunks;
+    
+    // Defaults
+    cfg.seq_tokens = cfg.n_chunks * cfg.chunk_size;
+    cfg.n_shared_chunks = 0;
+
+    if (iss >> cfg.seq_tokens) {
+        if (iss >> cfg.n_shared_chunks) {
+            // Read shared chunks count
+        }
+    }
 
     if (cfg.chunk_size != CHUNK_SIZE || cfg.d_head != D_HEAD) {
         std::cerr << "Config mismatch: "
@@ -153,7 +167,8 @@ int main(int argc, char** argv) {
 
     if (verbose) {
         std::cout << "Config: n_seqs=" << cfg.n_seqs << " n_heads=" << cfg.n_heads
-                  << " n_chunks=" << cfg.n_chunks << "\n";
+                  << " n_chunks=" << cfg.n_chunks << " seq_tokens=" << cfg.seq_tokens
+                  << " n_shared=" << cfg.n_shared_chunks << "\n";
     }
 
     // Sizes
@@ -171,14 +186,36 @@ int main(int argc, char** argv) {
     for (int c = 0; c < cfg.n_chunks; c++) { h_v[c].resize(kv_size); for (auto& x : h_v[c]) f >> x; }
     for (auto& x : ref_output) f >> x;
 
+    // Read cached intermediates if any
+    int ms_size = cfg.n_seqs * cfg.n_heads; // per chunk
+    int attn_size = cfg.n_seqs * cfg.n_heads * cfg.d_head; // per chunk
+    
+    // We allocate flat vectors for all shared chunks
+    std::vector<float> h_cached_maxs, h_cached_sums, h_cached_attns;
+    if (cfg.n_shared_chunks > 0) {
+        h_cached_maxs.resize(cfg.n_shared_chunks * ms_size);
+        h_cached_sums.resize(cfg.n_shared_chunks * ms_size);
+        h_cached_attns.resize(cfg.n_shared_chunks * attn_size);
+        
+        for (int c = 0; c < cfg.n_shared_chunks; c++) {
+            // Read maxs for chunk c
+            for (int i = 0; i < ms_size; i++) f >> h_cached_maxs[c * ms_size + i];
+            // Read sums for chunk c
+            for (int i = 0; i < ms_size; i++) f >> h_cached_sums[c * ms_size + i];
+            // Read attns for chunk c
+            for (int i = 0; i < attn_size; i++) f >> h_cached_attns[c * attn_size + i];
+        }
+    }
+
     // Allocate device memory
     bf16 *d_q, *d_output;
     std::vector<bf16*> d_k(cfg.n_chunks), d_v(cfg.n_chunks);
     void **d_keys, **d_vals;
     int *d_seq_chunk_map, *d_seq_n_tokens;
     int *d_offsets, *d_begins, *d_ends;
-    bf16 *d_attns;  // Dummy for cached path (not used when n_shared_chunks=0)
-    float *d_maxs, *d_sums;
+    
+    // Cached buffers
+    float *d_attns, *d_maxs, *d_sums;
 
     cudaMalloc(&d_q, q_size * sizeof(bf16));
     cudaMalloc(&d_output, out_size * sizeof(bf16));
@@ -189,15 +226,41 @@ int main(int argc, char** argv) {
         cudaMalloc(&d_v[c], kv_size * sizeof(bf16));
     }
 
-    // Dummy allocations for cached path (not used)
-    cudaMalloc(&d_attns, sizeof(bf16));
-    cudaMalloc(&d_maxs, sizeof(float));
-    cudaMalloc(&d_sums, sizeof(float));
+    // Metadata for chunks
     cudaMalloc(&d_offsets, cfg.n_chunks * sizeof(int));
     cudaMalloc(&d_begins, cfg.n_chunks * sizeof(int));
     cudaMalloc(&d_ends, cfg.n_chunks * sizeof(int));
+    
+    std::vector<int> h_begins(cfg.n_chunks, 0);
+    std::vector<int> h_ends(cfg.n_chunks, cfg.n_seqs); // all seqs in each chunk
+    std::vector<int> h_offsets(cfg.n_chunks);
+    // Offset logic: simple cumulative sequences
+    for (int c = 0; c < cfg.n_chunks; c++) h_offsets[c] = c * cfg.n_seqs;
+    
+    cudaMemcpy(d_begins, h_begins.data(), cfg.n_chunks * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_ends, h_ends.data(), cfg.n_chunks * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_offsets, h_offsets.data(), cfg.n_chunks * sizeof(int), cudaMemcpyHostToDevice);
 
-    // Convert to bf16 and copy
+    // Cached data buffers
+    if (cfg.n_shared_chunks > 0) {
+        int total_ms = cfg.n_shared_chunks * ms_size;
+        int total_attn = cfg.n_shared_chunks * attn_size;
+        
+        cudaMalloc(&d_maxs, total_ms * sizeof(float));
+        cudaMalloc(&d_sums, total_ms * sizeof(float));
+        cudaMalloc(&d_attns, total_attn * sizeof(float));
+        
+        cudaMemcpy(d_maxs, h_cached_maxs.data(), total_ms * sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_sums, h_cached_sums.data(), total_ms * sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_attns, h_cached_attns.data(), total_attn * sizeof(float), cudaMemcpyHostToDevice);
+    } else {
+        // Dummy allocations
+        cudaMalloc(&d_maxs, sizeof(float));
+        cudaMalloc(&d_sums, sizeof(float));
+        cudaMalloc(&d_attns, sizeof(float));
+    }
+
+    // Convert Q/K/V to bf16 and copy
     std::vector<bf16> tmp(std::max(q_size, kv_size));
     to_bf16(h_q.data(), tmp.data(), q_size);
     cudaMemcpy(d_q, tmp.data(), q_size * sizeof(bf16), cudaMemcpyHostToDevice);
@@ -217,8 +280,7 @@ int main(int argc, char** argv) {
     cudaMemcpy(d_keys, h_keys.data(), cfg.n_chunks * sizeof(void*), cudaMemcpyHostToDevice);
     cudaMemcpy(d_vals, h_vals.data(), cfg.n_chunks * sizeof(void*), cudaMemcpyHostToDevice);
 
-    // Setup seq_chunk_map: identity mapping [seq_idx, chunk_order] -> chunk_idx
-    // For test mode, all seqs use the same chunk order: 0, 1, 2, ..., n_chunks-1
+    // Setup mappings
     std::vector<int> h_seq_chunk_map(cfg.n_seqs * cfg.n_chunks);
     for (int s = 0; s < cfg.n_seqs; s++) {
         for (int c = 0; c < cfg.n_chunks; c++) {
@@ -229,8 +291,7 @@ int main(int argc, char** argv) {
     cudaMemcpy(d_seq_chunk_map, h_seq_chunk_map.data(),
                cfg.n_seqs * cfg.n_chunks * sizeof(int), cudaMemcpyHostToDevice);
 
-    // Setup seq_n_tokens: each seq has n_chunks * chunk_size tokens
-    std::vector<int> h_seq_n_tokens(cfg.n_seqs, cfg.n_chunks * cfg.chunk_size);
+    std::vector<int> h_seq_n_tokens(cfg.n_seqs, cfg.seq_tokens);
     cudaMalloc(&d_seq_n_tokens, cfg.n_seqs * sizeof(int));
     cudaMemcpy(d_seq_n_tokens, h_seq_n_tokens.data(),
                cfg.n_seqs * sizeof(int), cudaMemcpyHostToDevice);
@@ -241,9 +302,9 @@ int main(int argc, char** argv) {
     using Globals = attn_seq_first_globals<CHUNK_SIZE, D_HEAD>;
     Globals g {
         .output = gl<bf16, -1, -1, -1, -1>(d_output, 1, 1, out_size / D_HEAD, D_HEAD),
-        .attns = gl<bf16, -1, -1, -1, -1>(d_attns, 1, 1, 1, 1),  // dummy
-        .maxs = gl<float, -1, -1, -1, -1>(d_maxs, 1, 1, 1, 1),   // dummy
-        .sums = gl<float, -1, -1, -1, -1>(d_sums, 1, 1, 1, 1),   // dummy
+        .attns = gl<float, -1, -1, -1, -1>(d_attns, 1, 1, 1, 1),
+        .maxs = gl<float, -1, -1, -1, -1>(d_maxs, 1, 1, 1, 1),
+        .sums = gl<float, -1, -1, -1, -1>(d_sums, 1, 1, 1, 1),
         .offsets = gl<int, -1, -1, -1, -1>(d_offsets, 1, 1, 1, cfg.n_chunks),
         .begins = gl<int, -1, -1, -1, -1>(d_begins, 1, 1, 1, cfg.n_chunks),
         .ends = gl<int, -1, -1, -1, -1>(d_ends, 1, 1, 1, cfg.n_chunks),
@@ -255,39 +316,35 @@ int main(int argc, char** argv) {
         .seq_chunk_map_stride = cfg.n_chunks,
         .scale = 1.0f / sqrtf(float(cfg.d_head)),
         .n_heads = cfg.n_heads,
-        .n_shared_chunks = 0,  // All chunks computed fresh (no cached path)
+        .n_shared_chunks = cfg.n_shared_chunks,
         .delta_tokens = 0
     };
 
     // Compute shared memory size
     // Q_sv: d_head * sizeof(bf16)
-    // all_out_sv: NUM_WARPS * d_head * sizeof(bf16)
+    // all_out_sv: NUM_WARPS * d_head * sizeof(float)
     // all_KV_s: NUM_WARPS * chunk_size * d_head * sizeof(bf16)
-    // all_temp_sv: NUM_WARPS * d_head * sizeof(float)
+    // final_out_sv: d_head * sizeof(bf16)
     // warp_max/sum handled separately
     size_t smem = D_HEAD * sizeof(bf16) +                              // Q_sv
-                  NUM_WARPS_SF * D_HEAD * sizeof(bf16) +               // all_out_sv
+                  NUM_WARPS_SF * D_HEAD * sizeof(float) +              // all_out_sv (float)
                   NUM_WARPS_SF * CHUNK_SIZE * D_HEAD * sizeof(bf16) +  // all_KV_s
-                  NUM_WARPS_SF * D_HEAD * sizeof(float);               // all_temp_sv
-    smem = ((smem + 4095) / 4096) * 4096;  // Round up to 4KB
+                  D_HEAD * sizeof(bf16);                               // final_out_sv
+    smem = ((smem + 4095) / 4096) * 4096;
 
     cudaFuncSetAttribute(attn_seq_first_tk<CHUNK_SIZE, D_HEAD>,
                          cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     CUDA_CHECK();
 
-    // Launch: grid = (n_heads, n_seqs)
     dim3 grid(cfg.n_heads, cfg.n_seqs);
     attn_seq_first_tk<CHUNK_SIZE, D_HEAD><<<grid, BLOCK_THREADS_SF, smem>>>(g);
     CUDA_CHECK();
 
-    // Copy results back
     std::vector<bf16> h_output(out_size);
     cudaMemcpy(h_output.data(), d_output, out_size * sizeof(bf16), cudaMemcpyDeviceToHost);
 
-    // Verify
     bool pass = verify(cfg, h_output.data(), ref_output, verbose);
 
-    // Cleanup
     cudaFree(d_q);
     cudaFree(d_output);
     for (int c = 0; c < cfg.n_chunks; c++) { cudaFree(d_k[c]); cudaFree(d_v[c]); }
