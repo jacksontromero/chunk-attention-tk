@@ -41,7 +41,7 @@ The TK kernel is **slower** than native (~2.3 vs ~50 TFLOPS):
 | 4096   | 2.3         | 49.0            |
 | 16384  | 2.3         | 53.6            |
 
-This is expected. The sequence-first phase processes one query vector per sequence—it's vector-matrix products, not matrix-matrix. TK's tile abstractions add overhead (swizzled layouts, tile bookkeeping) without enabling tensor core use for this specific ocmputation. The native kernel's scalar dot products with manual shuffles are better suited here.
+This is expected. The sequence-first phase processes one query vector per sequence—it's vector-matrix products, not matrix-matrix. TK's tile abstractions add overhead (swizzled layouts, tile bookkeeping) without enabling tensor core use for this computation pattern. The native kernel's scalar dot products with manual shuffles are better suited here.
 
 ### Correctness
 
@@ -102,17 +102,19 @@ This kernel is inherently harder to optimize. Each sequence has one query vector
 The compute pattern:
 
 - Q is `[d_head]`, K is `[chunk_size, d_head]`
-- Score computation is `chunk_size` dot products (one per K row), not a matmul
-- Each warp computes all scores, with dot products parallelized across lanes via `__shfl_down_sync`
+- Score computation uses TK tile ops: broadcast Q across columns, element-wise multiply with K, then row-sum
+- This avoids explicit matmuls but still can't use tensor cores (it's fundamentally vector-matrix)
 
-TK doesn't help here—the tile abstraction assumes you're doing matmuls. We get the overhead of swizzled memory layouts without the benefit of tensor cores. The native kernel's manual `__shfl_down_sync` reductions are more efficient for this pattern.
+TK's tile abstractions add overhead (swizzled layouts, tile bookkeeping) without enabling tensor core use for this computation pattern. The native kernel's scalar dot products with manual shuffles are more efficient here.
 
-### Memory Loading
+### Memory Loading (Chunk-First)
 
-ChunkAttention stores KV cache as `void**` (array of pointers to per-chunk allocations). TK's TMA requires contiguous memory with compile-time strides, so we use a hybrid approach:
+ChunkAttention stores KV cache as `void**` (array of pointers to per-chunk allocations). TK's TMA requires contiguous memory with compile-time strides, so chunk-first uses a hybrid approach:
 
 - **Q uses TMA**: Hardware-accelerated async transfer directly into TK shared tiles
 - **K/V use cp.async**: Manual async copies with pointer indirection, respecting TK's swizzled layout
+
+Seq-first uses simpler manual loads since each warp processes chunks independently.
 
 ## Building
 
