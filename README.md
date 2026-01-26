@@ -139,3 +139,9 @@ For prefix caching specifically: the chunk-first phase (shared prefix) benefits 
 
 Jackson Romero, Ayush Kumar, Jason Wei
 CMU 15-779, Fall 2025
+
+### Contributions
+
+- Jackson created the TK kernels for ChunkAttention
+- Ayush created the TK kernels for Hydragen
+- Jason created the benchmarking and testing scripts
